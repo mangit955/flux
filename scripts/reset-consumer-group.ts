@@ -17,7 +17,7 @@ const redis = new RedisClient(REDIS_URL);
 
 async function resetConsumerGroup() {
   console.log("🔄 Resetting Consumer Group...\n");
-  console.log("⚠️  This will cause all commands to be reprocessed\n");
+  console.log("⚠️  This will reset pending entries and allow reprocessing\n");
   
   const markets = ['BTC-PERP', 'ETH-PERP'];
   
@@ -37,15 +37,21 @@ async function resetConsumerGroup() {
     }
     
     try {
-      // Delete the consumer group
-      await redis.xgroup('DESTROY', cmdStream, group);
-      console.log(`  ✅ Destroyed consumer group: ${group}`);
+      // Delete all consumers in the group first
+      const consumers = await redis.xinfo("CONSUMERS", cmdStream, group);
+      console.log(`  Found ${Math.floor(consumers.length / 8)} consumers in group`);
       
-      // Recreate starting from ID "0-0" to read ALL messages
-      await redis.xgroup('CREATE', cmdStream, group, '0-0', 'MKSTREAM');
-      console.log(`  ✅ Recreated consumer group starting from 0-0`);
+      for (let i = 0; i < consumers.length; i += 8) {
+        const consumerName = consumers[i + 1];
+        if (consumerName) {
+          await redis.xgroup("DELCONSUMER", cmdStream, group, String(consumerName));
+          console.log(`  ✅ Deleted consumer: ${consumerName}`);
+        }
+      }
       
-      const info = await redis.xinfo('GROUPS', cmdStream);
+      // Now reset the group's position to 0-0
+      await redis.xgroup('SETID', cmdStream, group, '0-0');
+      console.log(`  ✅ Reset consumer group position to 0-0`);
       console.log(`  ✓ Consumer group will now read all messages from beginning`);
       
     } catch (error: any) {
@@ -56,7 +62,7 @@ async function resetConsumerGroup() {
   }
   
   console.log("✅ Consumer groups reset!\n");
-  console.log("⚠️  IMPORTANT: Now restart the workers on Railway");
+  console.log("⚠️  IMPORTANT: Now restart the workers");
   console.log("   The workers will reprocess all commands and generate events\n");
   
   redis.quit();

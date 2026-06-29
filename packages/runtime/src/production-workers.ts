@@ -230,12 +230,15 @@ export class ProductionMatchingWorker {
       const consumer = this.options.consumerName ?? "matching-engine-1";
       
       try {
+        console.log(`[MATCHING] Reading from ${stream} with group ${group}, consumer ${consumer}`);
         const messages = await this.options.bus.readGroup<RuntimeCommand>(
           stream,
           group,
           consumer,
           { count: 10 },
         );
+
+        console.log(`[MATCHING] Read ${messages.length} messages from ${stream}`);
 
         for (const message of messages) {
           try {

@@ -8,11 +8,15 @@ import { Redis } from "ioredis";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const REDIS_URL = process.env.REDIS_URL;
+const RUNTIME_MODE = "development"; // Force development mode for local testing
 
 if (!DATABASE_URL || !REDIS_URL) {
   console.error("❌ DATABASE_URL and REDIS_URL required");
   process.exit(1);
 }
+
+// Force development mode
+process.env.RUNTIME_MODE = "development";
 
 const prisma = new PrismaClient({
   datasources: { db: { url: DATABASE_URL } },
@@ -31,7 +35,7 @@ async function sleep(ms: number) {
 }
 
 async function testProductionFlow() {
-  console.log("🧪 Testing Production Order Flow\n");
+  console.log("🧪 Testing Order Flow (Local In-Memory Mode)\n");
   console.log("═".repeat(60));
   
   try {
