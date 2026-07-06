@@ -10,6 +10,7 @@ import type {
 export interface ApiRuntime {
   register(email: string, password: string): Promise<{ id: string }>;
   login(email: string, password: string): Promise<{ token: string; userId: string }>;
+  loginAsGuest(): Promise<{ token: string; userId: string }>;
   authenticate(token: string | undefined): Promise<Pick<RuntimeUser, "id" | "email">>;
   listMarkets(): Promise<RuntimeMarket[]>;
   getMarket(marketId: string): Promise<RuntimeMarket | null>;
@@ -22,8 +23,12 @@ export interface ApiRuntime {
   listOrders(userId: string): Promise<RuntimeOrder[]>;
   getOrder(userId: string, orderId: string): Promise<RuntimeOrder | null>;
   listFills(userId: string): Promise<RuntimeFill[]>;
-  getOrderBook(marketId: string, depth?: number): Promise<unknown>;
+  getOrderBook(marketId: string, depth?: number): Promise<OrderBookSnapshot>;
   drain(maxIterations?: number): Promise<number>;
+}
+
+export interface OrderBookSnapshot {
+  sequence: number;
 }
 
 export class InMemoryApiRuntime implements ApiRuntime {
@@ -34,6 +39,15 @@ export class InMemoryApiRuntime implements ApiRuntime {
   }
 
   async login(email: string, password: string): Promise<{ token: string; userId: string }> {
+    return this.runtime.login(email, password);
+  }
+
+  async loginAsGuest(): Promise<{ token: string; userId: string }> {
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const email = `guest-${suffix}@guest.flux.local`;
+    const password = `guest-${suffix}`;
+
+    this.runtime.register(email, password);
     return this.runtime.login(email, password);
   }
 
@@ -112,7 +126,7 @@ export class InMemoryApiRuntime implements ApiRuntime {
     return this.runtime.drain(maxIterations);
   }
 
-  async getOrderBook(marketId: string, depth?: number) {
+  async getOrderBook(marketId: string, depth?: number): Promise<OrderBookSnapshot> {
     return this.runtime.getOrderBookSnapshot(marketId, depth);
   }
 }

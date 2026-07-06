@@ -187,6 +187,12 @@ export async function apiLogin(
   });
 }
 
+export async function apiGuestLogin(): Promise<{ token: string; userId: string }> {
+  return request("/auth/guest", {
+    method: "POST",
+  });
+}
+
 // ─── Markets ─────────────────────────────────────────────────────────────────
 
 export async function apiListMarkets(): Promise<ApiMarket[]> {

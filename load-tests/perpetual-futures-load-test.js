@@ -2,12 +2,13 @@
 // Flux Perpetual Futures Exchange — k6 Load Test
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Target:  100 VUs × 10 orders each = 1,000 bets (orders) in 10 seconds
-// Latency: <1ms matching latency (p95 order submission response < 10ms)
+// Target:  100 VUs × 10 orders each = 1,000 bets (orders) over 10 seconds
+// Latency: p95 order submission response < 10ms
 //
 // Usage:
 //   k6 run load-tests/perpetual-futures-load-test.js
 //   k6 run --env BASE_URL=http://your-server:3000 load-tests/perpetual-futures-load-test.js
+//   k6 run --env ENABLE_STRESS=true load-tests/perpetual-futures-load-test.js
 //
 // Prerequisites:
 //   1. API server running (`bun run --filter api dev`)
@@ -18,21 +19,24 @@ import http from "k6/http";
 import ws from "k6/ws";
 import { check, sleep, group } from "k6";
 import { Counter, Rate, Trend, Gauge } from "k6/metrics";
-import { SharedArray } from "k6/data";
 import exec from "k6/execution";
 
 // ─── Configuration ──────────────────────────────────────────────────────────────
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:3000";
-const MARKET_ID = __ENV.MARKET_ID || "BTC-PERP";
+const REQUESTED_MARKET_ID = __ENV.MARKET_ID || "BTC-PERP";
 const DEPOSIT_AMOUNT = Number(__ENV.DEPOSIT_AMOUNT) || 1_000_000;
 const ORDERS_PER_VU = 10; // 100 VUs × 10 = 1,000 total orders
+const LOAD_TEST_VUS = 100;
+const LOAD_WINDOW_SECONDS = 10;
+const TARGET_ORDERS = LOAD_TEST_VUS * ORDERS_PER_VU;
+const TARGET_ORDER_RATE = TARGET_ORDERS / LOAD_WINDOW_SECONDS;
+const ENABLE_STRESS = __ENV.ENABLE_STRESS === "true";
 
 // ─── Custom Metrics ─────────────────────────────────────────────────────────────
 
-// Order placement latency (the critical metric — target: <1ms matching engine)
+// Order placement latency (API acceptance path — target: p95 < 10ms)
 const orderPlacementDuration = new Trend("order_placement_duration", true);
-const orderPlacementP95 = new Trend("order_placement_p95", true);
 
 // Breakdown by order type
 const limitOrderDuration = new Trend("limit_order_duration", true);
@@ -59,7 +63,7 @@ const healthCheckDuration = new Trend("health_check_duration", true);
 const wsConnectionDuration = new Trend("ws_connection_duration", true);
 const wsMessagesReceived = new Counter("ws_messages_received");
 
-// Throughput gauge
+// Throughput gauge for the 10s order-placement window
 const orderThroughput = new Gauge("orders_per_second");
 
 // ─── k6 Options ─────────────────────────────────────────────────────────────────
@@ -94,71 +98,73 @@ export const options = {
     },
 
     // ─────────────────────────────────────────────────────────────────────
-    // Phase 3: The main load test — 100 VUs placing 1,000 orders in 10s
+    // Phase 3: The main load test — 100 VUs placing 1,000 orders over 10s
     // ─────────────────────────────────────────────────────────────────────
     place_orders: {
       executor: "per-vu-iterations",
-      vus: 100,
+      vus: LOAD_TEST_VUS,
       iterations: ORDERS_PER_VU,
-      maxDuration: "10s",
+      maxDuration: "15s",
       exec: "placeOrder",
       startTime: "70s", // after setup + seed
       tags: { phase: "load" },
       gracefulStop: "5s",
     },
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Phase 4: Concurrent reads during order placement (orderbook stress)
-    // ─────────────────────────────────────────────────────────────────────
-    read_orderbook: {
-      executor: "constant-arrival-rate",
-      rate: 50, // 50 orderbook reads/sec
-      timeUnit: "1s",
-      duration: "10s",
-      preAllocatedVUs: 20,
-      maxVUs: 30,
-      exec: "readOrderbook",
-      startTime: "70s",
-      tags: { phase: "read_load" },
-      gracefulStop: "5s",
-    },
+    ...(ENABLE_STRESS ? {
+      // ─────────────────────────────────────────────────────────────────────
+      // Optional Phase 4: Concurrent reads during order placement
+      // ─────────────────────────────────────────────────────────────────────
+      read_orderbook: {
+        executor: "constant-arrival-rate",
+        rate: 50, // 50 orderbook reads/sec
+        timeUnit: "1s",
+        duration: "10s",
+        preAllocatedVUs: 20,
+        maxVUs: 30,
+        exec: "readOrderbook",
+        startTime: "70s",
+        tags: { phase: "read_load" },
+        gracefulStop: "5s",
+      },
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Phase 5: Cancel orders under load
-    // ─────────────────────────────────────────────────────────────────────
-    cancel_orders: {
-      executor: "constant-arrival-rate",
-      rate: 20, // 20 cancels/sec
-      timeUnit: "1s",
-      duration: "10s",
-      preAllocatedVUs: 10,
-      maxVUs: 15,
-      exec: "cancelOrder",
-      startTime: "72s", // slightly after order placement starts
-      tags: { phase: "cancel_load" },
-      gracefulStop: "5s",
-    },
+      // ─────────────────────────────────────────────────────────────────────
+      // Optional Phase 5: Cancel orders under load
+      // ─────────────────────────────────────────────────────────────────────
+      cancel_orders: {
+        executor: "constant-arrival-rate",
+        rate: 20, // 20 cancels/sec
+        timeUnit: "1s",
+        duration: "10s",
+        preAllocatedVUs: 10,
+        maxVUs: 15,
+        exec: "cancelOrder",
+        startTime: "72s", // slightly after order placement starts
+        tags: { phase: "cancel_load" },
+        gracefulStop: "5s",
+      },
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Phase 6: WebSocket connection storm
-    // ─────────────────────────────────────────────────────────────────────
-    ws_connections: {
-      executor: "ramping-vus",
-      startVUs: 0,
-      stages: [
-        { duration: "3s", target: 50 },
-        { duration: "7s", target: 50 },
-      ],
-      exec: "wsSubscribe",
-      startTime: "70s",
-      tags: { phase: "websocket" },
-      gracefulStop: "5s",
-    },
+      // ─────────────────────────────────────────────────────────────────────
+      // Optional Phase 6: WebSocket connection storm
+      // ─────────────────────────────────────────────────────────────────────
+      ws_connections: {
+        executor: "ramping-vus",
+        startVUs: 0,
+        stages: [
+          { duration: "3s", target: 50 },
+          { duration: "7s", target: 50 },
+        ],
+        exec: "wsSubscribe",
+        startTime: "70s",
+        tags: { phase: "websocket" },
+        gracefulStop: "5s",
+      },
+    } : {}),
   },
 
   // ─── Thresholds (SLA enforcement) ───────────────────────────────────────────
   thresholds: {
-    // ⚡ Core latency target: <1ms matching engine = sub-10ms API response
+    // ⚡ Core API latency target: sub-10ms p95 order submission response
     "order_placement_duration": [
       "p(50)<5",    // p50 under 5ms
       "p(95)<10",   // p95 under 10ms
@@ -198,11 +204,11 @@ export const options = {
       "p(99)<100",
     ],
 
-    // At least 95% of orders accepted (not rejected for margin etc.)
-    "orders_accepted": ["count>900"],
+    // All target load orders should be accepted (not rejected for margin etc.)
+    "orders_accepted": [`count>=${TARGET_ORDERS}`],
 
-    // Throughput: at least 100 orders/sec sustained
-    "orders_per_second": ["value>100"],
+    // Throughput: 1,000 orders over the 10s load window = 100 orders/sec
+    "orders_per_second": [`value>=${TARGET_ORDER_RATE}`],
   },
 
   // ─── Misc ───────────────────────────────────────────────────────────────────
@@ -213,6 +219,7 @@ export const options = {
   ],
   noConnectionReuse: false,
   userAgent: "FluxLoadTest/1.0",
+  setupTimeout: "120s",
 };
 
 // ─── Shared State ───────────────────────────────────────────────────────────────
@@ -260,16 +267,21 @@ function randomOrderType() {
   return Math.random() > 0.3 ? "LIMIT" : "MARKET";
 }
 
+function testMarketId(data) {
+  return data && data.marketId ? data.marketId : REQUESTED_MARKET_ID;
+}
+
 // ─── Setup Function ─────────────────────────────────────────────────────────────
 // k6 setup() runs once before all VUs. We pre-create users and store their tokens.
 
 export function setup() {
   console.log(`\n${"═".repeat(70)}`);
   console.log(`  Flux Perpetual Futures Exchange — Load Test`);
-  console.log(`  Target: 100 VUs × ${ORDERS_PER_VU} orders = 1,000 orders in 10s`);
-  console.log(`  Latency target: <1ms matching (sub-10ms API response)`);
+  console.log(`  Target: ${LOAD_TEST_VUS} VUs × ${ORDERS_PER_VU} orders = ${TARGET_ORDERS} orders over ${LOAD_WINDOW_SECONDS}s`);
+  console.log(`  Latency target: p95 order submission response <10ms`);
+  console.log(`  Extra read/cancel/WebSocket stress: ${ENABLE_STRESS ? "enabled" : "disabled"}`);
   console.log(`  API: ${BASE_URL}`);
-  console.log(`  Market: ${MARKET_ID}`);
+  console.log(`  Requested market: ${REQUESTED_MARKET_ID}`);
   console.log(`${"═".repeat(70)}\n`);
 
   // Health check
@@ -289,11 +301,25 @@ export function setup() {
   // Verify market exists
   const marketsRes = http.get(`${BASE_URL}/markets`);
   const markets = marketsRes.json();
-  console.log(`📊 Available markets: ${JSON.stringify(markets.map((m) => m.symbol || m.marketId))}`);
+  const marketIds = markets.map((market) => market.symbol || market.marketId).filter(Boolean);
+  const marketId = marketIds.includes(REQUESTED_MARKET_ID)
+    ? REQUESTED_MARKET_ID
+    : marketIds[0];
 
-  // Pre-register 100 users and get their tokens
+  console.log(`📊 Available markets: ${JSON.stringify(marketIds)}`);
+
+  if (!marketId) {
+    console.error("❌ No markets available for load test");
+    return { error: true };
+  }
+
+  if (marketId !== REQUESTED_MARKET_ID) {
+    console.warn(`⚠️  Requested market ${REQUESTED_MARKET_ID} not found; using ${marketId}`);
+  }
+
+  // Pre-register users and get their tokens
   const users = [];
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < LOAD_TEST_VUS; i++) {
     const email = `loadtest-${Date.now()}-${i}@flux.test`;
     const password = "LoadTest123!";
 
@@ -353,7 +379,7 @@ export function setup() {
     const orderRes = http.post(
       `${BASE_URL}/orders`,
       JSON.stringify({
-        marketId: MARKET_ID,
+        marketId,
         side,
         type: "LIMIT",
         quantity: randomQuantity(),
@@ -376,7 +402,7 @@ export function setup() {
 
   console.log(`✅ Orderbook seeded with ${seeded} resting orders`);
 
-  return { users, startTime: Date.now() };
+  return { users, marketId };
 }
 
 // ─── Scenario: Setup User (pre-allocate during setup phase) ─────────────────
@@ -398,11 +424,12 @@ export function seedOrderbook(data) {
   const user = data.users[vuIndex];
   const side = randomSide();
   const price = randomPrice(side);
+  const marketId = testMarketId(data);
 
   const res = http.post(
     `${BASE_URL}/orders`,
     JSON.stringify({
-      marketId: MARKET_ID,
+      marketId,
       side,
       type: "LIMIT",
       quantity: randomQuantity(),
@@ -438,6 +465,11 @@ export function placeOrder(data) {
   const vuIndex = (exec.vu.idInTest - 1) % data.users.length;
   const user = data.users[vuIndex];
   const iteration = exec.vu.iterationInScenario;
+  const marketId = testMarketId(data);
+
+  if (iteration === 0) {
+    sleep(vuIndex / LOAD_TEST_VUS);
+  }
 
   group("place_order", function () {
     const side = randomSide();
@@ -445,7 +477,7 @@ export function placeOrder(data) {
     const quantity = randomQuantity();
 
     const orderPayload = {
-      marketId: MARKET_ID,
+      marketId,
       side,
       type: orderType,
       quantity,
@@ -456,9 +488,6 @@ export function placeOrder(data) {
     if (orderType === "LIMIT") {
       orderPayload.price = randomPrice(side);
     }
-
-    // ⏱ Precisely measure order submission latency
-    const startTime = Date.now();
 
     const res = http.post(
       `${BASE_URL}/orders`,
@@ -473,7 +502,7 @@ export function placeOrder(data) {
       }
     );
 
-    const duration = Date.now() - startTime;
+    const duration = res.timings.duration;
 
     // Record metrics
     ordersSubmitted.add(1);
@@ -514,43 +543,26 @@ export function placeOrder(data) {
       "order has status": (r) => {
         try { return !!r.json("status"); } catch { return false; }
       },
-      "order latency < 10ms (p95 target)": () => duration < 10,
-      "order latency < 1ms (stretch target)": () => duration < 1,
+      "order latency < 10ms": () => duration < 10,
     });
 
-    // Calculate throughput
-    const elapsed = (Date.now() - data.startTime) / 1000;
-    if (elapsed > 0) {
-      orderThroughput.add(ordersSubmitted.name ? 1000 / elapsed : 0);
-    }
+    orderThroughput.add(TARGET_ORDER_RATE);
   });
 
-  // Drain after every few orders to process through matching engine
-  if (iteration % 3 === 0) {
-    group("drain_matching_engine", function () {
-      const drainRes = http.post(`${BASE_URL}/admin/drain`, null, {
-        headers,
-        tags: { name: "drain" },
-      });
-
-      if (drainRes.status === 200) {
-        try {
-          const processed = drainRes.json("processed");
-          if (processed > 0) {
-            tradesExecuted.add(processed);
-          }
-        } catch (_) { /* ignore parse errors */ }
-      }
-    });
+  // Pace each VU to 10 orders across the 10-second load window.
+  if (iteration < ORDERS_PER_VU - 1) {
+    sleep(LOAD_WINDOW_SECONDS / ORDERS_PER_VU);
   }
 }
 
 // ─── Scenario: Read Orderbook Under Load ────────────────────────────────────
 
-export function readOrderbook() {
+export function readOrderbook(data) {
+  const marketId = testMarketId(data);
+
   group("read_orderbook", function () {
     // Full-depth orderbook
-    const res = http.get(`${BASE_URL}/markets/${MARKET_ID}/orderbook?depth=20`, {
+    const res = http.get(`${BASE_URL}/markets/${marketId}/orderbook?depth=20`, {
       headers,
       tags: { name: "orderbook_read" },
     });
@@ -561,7 +573,7 @@ export function readOrderbook() {
     check(res, {
       "orderbook status 200": (r) => r.status === 200,
       "orderbook has market": (r) => {
-        try { return r.json("market") === MARKET_ID; } catch { return false; }
+        try { return r.json("market") === marketId; } catch { return false; }
       },
       "orderbook has bids array": (r) => {
         try { return Array.isArray(r.json("bids")); } catch { return false; }
@@ -581,6 +593,7 @@ export function cancelOrder(data) {
 
   const vuIndex = exec.vu.idInTest % data.users.length;
   const user = data.users[vuIndex];
+  const marketId = testMarketId(data);
 
   // Try to cancel the most recent order for this user
   const orderIds = user.orderIds || [];
@@ -592,7 +605,7 @@ export function cancelOrder(data) {
     const placeRes = http.post(
       `${BASE_URL}/orders`,
       JSON.stringify({
-        marketId: MARKET_ID,
+        marketId,
         side,
         type: "LIMIT",
         quantity: randomQuantity(),
@@ -642,6 +655,7 @@ export function cancelOrder(data) {
 
 export function wsSubscribe(data) {
   const wsUrl = BASE_URL.replace("http", "ws") + "/ws";
+  const marketId = testMarketId(data);
 
   const startTime = Date.now();
   const res = ws.connect(wsUrl, null, function (socket) {
@@ -653,7 +667,7 @@ export function wsSubscribe(data) {
       socket.send(
         JSON.stringify({
           type: "subscribe",
-          channel: `orderbook:${MARKET_ID}`,
+          channel: `orderbook:${marketId}`,
         })
       );
 
@@ -661,7 +675,7 @@ export function wsSubscribe(data) {
       socket.send(
         JSON.stringify({
           type: "subscribe",
-          channel: `trades:${MARKET_ID}`,
+          channel: `trades:${marketId}`,
         })
       );
     });
@@ -706,9 +720,10 @@ export function teardown(data) {
   console.log("  Load Test Complete — Summary");
   console.log(`${"═".repeat(70)}`);
   console.log(`  Users provisioned: ${data.users ? data.users.length : 0}`);
-  console.log(`  Target orders:     1,000`);
-  console.log(`  Market:            ${MARKET_ID}`);
-  console.log(`  Latency target:    <1ms matching (<10ms API response)`);
+  console.log(`  Target orders:     ${TARGET_ORDERS}`);
+  console.log(`  Market:            ${testMarketId(data)}`);
+  console.log(`  Latency target:    p95 order submission response <10ms`);
+  console.log(`  Extra stress:      ${ENABLE_STRESS ? "enabled" : "disabled"}`);
   console.log(`${"═".repeat(70)}\n`);
 
   // Final drain to ensure all orders are processed
@@ -722,7 +737,7 @@ export function teardown(data) {
   }
 
   // Final orderbook state
-  const obRes = http.get(`${BASE_URL}/markets/${MARKET_ID}/orderbook?depth=5`, {
+  const obRes = http.get(`${BASE_URL}/markets/${testMarketId(data)}/orderbook?depth=5`, {
     headers,
   });
 

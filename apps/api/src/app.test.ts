@@ -140,6 +140,44 @@ describe("api app", () => {
     expect(orderbook.bids[0]?.priceTicks).toBe(99);
     expect(orderbook.asks[0]?.priceTicks).toBe(101);
   });
+
+  it("creates guest sessions that can use authenticated trading workflows", async () => {
+    const app = createApiApp();
+
+    const guest = await json<{ token: string; userId: string }>(
+      await app.fetch(post("/auth/guest", {})),
+    );
+
+    expect(guest.token).toBeTruthy();
+    expect(guest.userId).toBeTruthy();
+
+    const balance = await json<{ userId: string; total: number }>(
+      await app.fetch(authPost("/deposits", guest.token, {
+        asset: "USDC",
+        amount: 10_000,
+      })),
+    );
+    const order = await json<{ userId: string; status: string }>(
+      await app.fetch(authPost("/orders", guest.token, {
+        marketId: "BTC-PERP",
+        side: "BUY",
+        type: "LIMIT",
+        quantity: 1,
+        price: 99,
+        timeInForce: "GTC",
+      })),
+    );
+    const orders = await json<Array<{ userId: string }>>(
+      await app.fetch(authGet("/orders", guest.token)),
+    );
+
+    expect(balance.userId).toBe(guest.userId);
+    expect(balance.total).toBe(10_000);
+    expect(order.userId).toBe(guest.userId);
+    expect(order.status).toBe("PENDING");
+    expect(orders).toHaveLength(1);
+    expect(orders[0]?.userId).toBe(guest.userId);
+  });
 });
 
 function post(path: string, body: unknown): Request {

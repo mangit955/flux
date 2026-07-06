@@ -7,7 +7,7 @@ import {
   useEffect,
   useState,
 } from "react";
-import { apiLogin, apiRegister, ApiError } from "@/lib/api";
+import { apiGuestLogin, apiLogin, apiRegister, ApiError } from "@/lib/api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -19,6 +19,7 @@ interface AuthState {
 
 interface AuthActions {
   login: (email: string, password: string) => Promise<void>;
+  loginAsGuest: () => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   logout: () => void;
 }
@@ -66,6 +67,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [persist],
   );
 
+  const loginAsGuest = useCallback(async () => {
+    const result = await apiGuestLogin();
+    persist(result.token, result.userId);
+  }, [persist]);
+
   const register = useCallback(
     async (email: string, password: string) => {
       await apiRegister(email, password);
@@ -92,6 +98,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         userId,
         isLoggedIn: token !== null,
         login,
+        loginAsGuest,
         register,
         logout,
       }}

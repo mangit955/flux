@@ -27,7 +27,7 @@ export function createApiApp(options: ApiAppOptions = {}) {
   hub.onSubscribe("orderbook", async (connectionId, topic) => {
     // Extract market from topic (format: "orderbook:MARKET-ID")
     const marketMatch = topic.match(/^orderbook:(.+)$/);
-    if (marketMatch) {
+    if (marketMatch?.[1]) {
       const marketId = marketMatch[1];
       try {
         // Use runtime.getOrderBook which will fetch from Redis cache in production
@@ -68,6 +68,10 @@ export function createApiApp(options: ApiAppOptions = {}) {
       if (method === "POST" && url.pathname === "/auth/login") {
         const body = await readJson<{ email: string; password: string }>(request);
         return json(await runtime.login(body.email, body.password));
+      }
+
+      if (method === "POST" && url.pathname === "/auth/guest") {
+        return json(await runtime.loginAsGuest(), 201);
       }
 
       if (method === "GET" && url.pathname === "/markets") {

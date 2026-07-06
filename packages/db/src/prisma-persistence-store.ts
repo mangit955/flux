@@ -23,6 +23,7 @@ export interface PrismaTransactionLike {
     create(args: { data: ProcessedEventWrite }): Promise<unknown>;
   };
   order: {
+    findUnique(args: { where: { id: string } }): Promise<unknown | null>;
     upsert(args: {
       where: { id: string };
       create: OrderWrite;
@@ -51,6 +52,12 @@ export interface PrismaTransactionLike {
       data: FillWrite[];
       skipDuplicates: boolean;
     }): Promise<unknown>;
+  };
+  balance: {
+    findUnique(args: {
+      where: { userId_asset: { userId: string; asset: string } };
+    }): Promise<unknown | null>;
+    update(args: unknown): Promise<unknown>;
   };
 }
 

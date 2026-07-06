@@ -50,6 +50,7 @@ export interface PrismaApiTransaction {
     findUnique(args: {
       where: { userId_asset: { userId: string; asset: string } };
     }): Promise<unknown | null>;
+    update(args: unknown): Promise<unknown>;
     upsert(args: unknown): Promise<unknown>;
   };
   ledgerEntry: {
@@ -124,6 +125,26 @@ export class PrismaApiRuntime implements ApiRuntime {
     }
 
     console.log(`✅ Login successful for user: ${String(field(user, "id"))}`);
+    const userId = String(field(user, "id"));
+    const token = await issueJwt({
+      userId,
+      email,
+      secret: this.options.jwtSecret,
+      now: this.now(),
+    });
+
+    return { token, userId };
+  }
+
+  async loginAsGuest(): Promise<{ token: string; userId: string }> {
+    const guestId = crypto.randomUUID();
+    const email = `guest-${guestId}@guest.flux.local`;
+    const passwordHash = await hashPassword(`guest-${guestId}`);
+
+    const user = await this.options.client.user.create({
+      data: { email, passwordHash },
+    });
+
     const userId = String(field(user, "id"));
     const token = await issueJwt({
       userId,
