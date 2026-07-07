@@ -15,8 +15,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html className="dark bg-[#09090b]" lang="en">
-      <body className="bg-[#09090b] text-[#fafafa]">
+    <html className="dark bg-[#09090b]" lang="en" suppressHydrationWarning>
+      <body
+        className="bg-[#09090b] text-[#fafafa]"
+        suppressHydrationWarning
+      >
         <AuthProvider>
           <SmoothScroll>{children}</SmoothScroll>
         </AuthProvider>
