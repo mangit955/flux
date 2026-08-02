@@ -11,6 +11,8 @@ export interface ApiAppOptions {
   apiRuntime?: ApiRuntime;
   priceCache?: PriceCache;
   hub?: WebSocketHub;
+  /** Allows tests to exercise development-only routes without mutating Bun.env. */
+  environment?: string;
 }
 
 export function createApiApp(options: ApiAppOptions = {}) {
@@ -22,6 +24,8 @@ export function createApiApp(options: ApiAppOptions = {}) {
     options.apiRuntime ??
     new InMemoryApiRuntime(options.runtime ?? exchangeRuntime);
   const priceCache = options.priceCache ?? null;
+  const fakeDepositsEnabled =
+    (options.environment ?? Bun.env.NODE_ENV) === "development";
 
   // Register orderbook snapshot provider
   hub.onSubscribe("orderbook", async (connectionId, topic) => {
@@ -111,7 +115,11 @@ export function createApiApp(options: ApiAppOptions = {}) {
         return data ? json(data) : jsonError("PRICE_NOT_FOUND", 404);
       }
 
-      if (method === "POST" && url.pathname === "/deposits") {
+      if (
+        fakeDepositsEnabled &&
+        method === "POST" &&
+        url.pathname === "/deposits"
+      ) {
         const user = await runtime.authenticate(authToken(request));
         const body = await readJson<{ asset: string; amount: number | string }>(request);
         return json(await runtime.deposit(user.id, body.asset, Number(body.amount)), 201);

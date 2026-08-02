@@ -3,7 +3,7 @@ import { createApiApp } from "./app";
 
 describe("api app", () => {
   it("registers users, deposits collateral, submits orders, and exposes fills", async () => {
-    const app = createApiApp();
+    const app = createApiApp({ environment: "development" });
 
     const maker = await json<{ userId: string }>(
       await app.fetch(post("/auth/register", {
@@ -70,7 +70,7 @@ describe("api app", () => {
   });
 
   it("exposes orderbook data", async () => {
-    const app = createApiApp();
+    const app = createApiApp({ environment: "development" });
 
     // Test empty orderbook initially
     const emptyOrderbook = await json<{
@@ -142,7 +142,7 @@ describe("api app", () => {
   });
 
   it("creates guest sessions that can use authenticated trading workflows", async () => {
-    const app = createApiApp();
+    const app = createApiApp({ environment: "development" });
 
     const guest = await json<{ token: string; userId: string }>(
       await app.fetch(post("/auth/guest", {})),
@@ -177,6 +177,20 @@ describe("api app", () => {
     expect(order.status).toBe("PENDING");
     expect(orders).toHaveLength(1);
     expect(orders[0]?.userId).toBe(guest.userId);
+  });
+
+  it("does not expose fake deposits outside development", async () => {
+    const app = createApiApp({ environment: "production" });
+    const guest = await json<{ token: string }>(
+      await app.fetch(post("/auth/guest", {})),
+    );
+
+    const response = await app.fetch(authPost("/deposits", guest.token, {
+      asset: "USDC",
+      amount: 10_000,
+    }));
+
+    expect(response.status).toBe(404);
   });
 });
 

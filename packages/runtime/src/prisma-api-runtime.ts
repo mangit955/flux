@@ -77,20 +77,14 @@ export class PrismaApiRuntime implements ApiRuntime {
 
   async register(email: string, password: string): Promise<{ id: string }> {
     validateEmail(email);
-    
-    console.log(`📝 Registration attempt for email: ${email}`);
-    console.log(`📝 Password length: ${password.length}`);
-    console.log(`📝 Password provided: ${password}`);
-    
+
     const passwordHash = await hashPassword(password);
-    console.log(`📝 Generated hash: ${passwordHash.substring(0, 20)}...`);
 
     try {
       const user = await this.options.client.user.create({
         data: { email, passwordHash },
       });
 
-      console.log(`✅ User registered successfully: ${String(field(user, "id"))}`);
       return { id: String(field(user, "id")) };
     } catch (error) {
       if (isUniqueConstraintError(error)) {
@@ -102,29 +96,19 @@ export class PrismaApiRuntime implements ApiRuntime {
   }
 
   async login(email: string, password: string): Promise<{ token: string; userId: string }> {
-    console.log(`🔐 Login attempt for email: ${email}`);
-    
     const user = await this.options.client.user.findUnique({ where: { email } });
 
     if (!user) {
-      console.log(`❌ User not found for email: ${email}`);
       throw new Error("invalid credentials");
     }
 
     const storedHash = String(field(user, "passwordHash"));
-    console.log(`🔑 Stored hash: ${storedHash.substring(0, 20)}...`);
-    console.log(`🔑 Password length: ${password.length}`);
-    console.log(`🔑 Password provided: ${password}`);
-    
     const isValid = await verifyPassword(password, storedHash);
-    console.log(`🔑 Password verification result: ${isValid}`);
-    
+
     if (!isValid) {
-      console.log(`❌ Invalid password for email: ${email}`);
       throw new Error("invalid credentials");
     }
 
-    console.log(`✅ Login successful for user: ${String(field(user, "id"))}`);
     const userId = String(field(user, "id"));
     const token = await issueJwt({
       userId,
