@@ -18,12 +18,17 @@ import type {
 } from "./types";
 import type { RuntimeCommand } from "./types";
 import type { OrderBookCache } from "./orderbook-cache";
+import type { PriceCache } from "./price-cache";
+import { estimateMarketOrderRiskPrice, type MarketOrderRiskPrice } from "./market-order-risk";
 
 export interface PrismaApiRuntimeOptions {
   client: PrismaApiClient;
   jwtSecret: string;
   clock?: () => number;
   orderBookCache?: OrderBookCache;
+  priceCache?: PriceCache;
+  marketOrderSlippageBufferRate?: number;
+  maxMarketDataAgeMs?: number;
 }
 
 export interface PrismaApiClient {
@@ -269,6 +274,15 @@ export class PrismaApiRuntime implements ApiRuntime {
       throw new Error("market not found");
     }
 
+    const marketOrderRisk = input.type === "MARKET"
+      ? await this.resolveMarketOrderRisk(input)
+      : undefined;
+    const riskPrice = marketOrderRisk?.marginPrice ?? input.price;
+
+    if (riskPrice == null || !Number.isFinite(riskPrice) || riskPrice <= 0) {
+      throw new Error("invalid order price");
+    }
+
     const balance = await this.getBalance(input.userId, market.quoteAsset);
     const positions = await this.options.client.position.findMany({
       where: { userId: input.userId },
@@ -299,14 +313,14 @@ export class PrismaApiRuntime implements ApiRuntime {
       {
         marketId: input.marketId,
         side: input.side,
-        price: input.price ?? 0,
+        price: riskPrice,
         quantity: input.quantity,
         reduceOnly: input.reduceOnly ?? false,
         estimatedFeeRate: market.takerFeeRate,
         leverage: input.leverage ?? 10,
       },
       [market],
-      [{ marketId: input.marketId, price: input.price ?? 0 }],
+      [{ marketId: input.marketId, price: riskPrice }],
     );
 
     if (!check.ok) {
@@ -330,6 +344,8 @@ export class PrismaApiRuntime implements ApiRuntime {
         type: input.type === "MARKET" ? "market" : "limit",
         qtyLots: input.quantity,
         priceTicks: input.price,
+        minPriceTicks: marketOrderRisk?.minExecutionPrice,
+        maxPriceTicks: marketOrderRisk?.maxExecutionPrice,
         timeInForce: input.timeInForce,
         reduceOnly: input.reduceOnly,
         postOnly: input.postOnly,
@@ -529,6 +545,32 @@ export class PrismaApiRuntime implements ApiRuntime {
 
   private now(): number {
     return this.options.clock?.() ?? Date.now();
+  }
+
+  private async resolveMarketOrderRisk(
+    input: SubmitOrderInput,
+  ): Promise<MarketOrderRiskPrice> {
+    if (!this.options.orderBookCache || !this.options.priceCache) {
+      throw new Error("market order risk data unavailable");
+    }
+
+    const [orderBook, price] = await Promise.all([
+      this.options.orderBookCache.get(input.marketId),
+      this.options.priceCache.get(input.marketId),
+    ]);
+
+    const maxAgeMs = this.options.maxMarketDataAgeMs ?? 10_000;
+    if (!orderBook || !price || this.now() - price.timestamp > maxAgeMs) {
+      throw new Error("market order risk data unavailable");
+    }
+
+    return estimateMarketOrderRiskPrice({
+      side: input.side,
+      quantity: input.quantity,
+      orderBook,
+      markPrice: price.markPrice,
+      slippageBufferRate: this.options.marketOrderSlippageBufferRate,
+    });
   }
 }
 

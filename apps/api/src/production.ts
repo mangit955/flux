@@ -11,13 +11,16 @@ export async function createProductionApiApp() {
     datasources: { db: { url: databaseUrl } },
   });
 
+  const priceCache = new RedisPriceCache({ redisUrl });
+
   return createApiApp({
     apiRuntime: new PrismaApiRuntime({
       client,
       jwtSecret,
       orderBookCache: new RedisOrderBookCache({ redisUrl }),
+      priceCache,
     }),
-    priceCache: new RedisPriceCache({ redisUrl }),
+    priceCache,
   });
 }
 

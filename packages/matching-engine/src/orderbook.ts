@@ -31,6 +31,8 @@ interface OrderNode extends Order {
 
 interface IncomingOrder extends Order {
   sequence: number;
+  minPriceTicks?: number;
+  maxPriceTicks?: number;
 }
 
 export class OrderBook {
@@ -196,6 +198,14 @@ export class OrderBook {
       return "MARKET_ORDER_HAS_PRICE";
     }
 
+    if (
+      command.type === "market" &&
+      ((command.minPriceTicks != null && command.minPriceTicks <= 0) ||
+        (command.maxPriceTicks != null && command.maxPriceTicks <= 0))
+    ) {
+      return "INVALID_PRICE";
+    }
+
     if (command.type === "limit" && command.priceTicks == null) {
       return "LIMIT_ORDER_MISSING_PRICE";
     }
@@ -233,6 +243,8 @@ export class OrderBook {
       qtyLots: command.qtyLots,
       remainingQtyLots: command.qtyLots,
       priceTicks: command.priceTicks,
+      minPriceTicks: command.minPriceTicks,
+      maxPriceTicks: command.maxPriceTicks,
       status: "OPEN",
       timeInForce: command.timeInForce,
       reduceOnly: command.reduceOnly ?? false,
@@ -433,6 +445,14 @@ export class OrderBook {
 
   private canCross(order: IncomingOrder, bestLevel: PriceLevel): boolean {
     if (order.type === "market") {
+      if (order.side === "buy" && order.maxPriceTicks != null) {
+        return bestLevel.priceTicks <= order.maxPriceTicks;
+      }
+
+      if (order.side === "sell" && order.minPriceTicks != null) {
+        return bestLevel.priceTicks >= order.minPriceTicks;
+      }
+
       return true;
     }
 

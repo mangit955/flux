@@ -4,6 +4,7 @@ import { commandStream, InMemoryStreamBus, type StreamBus } from "./stream";
 import { RuntimeStore } from "./store";
 import type { RuntimeCommand, RuntimeOrder } from "./types";
 import { MatchingWorker, RuntimePersistenceWorker } from "./workers";
+import { estimateMarketOrderRiskPrice, type MarketOrderRiskPrice } from "./market-order-risk";
 
 export interface SubmitOrderInput {
   userId: string;
@@ -96,6 +97,15 @@ export class ExchangeRuntime {
       throw new Error("market not found");
     }
 
+    const marketOrderRisk = input.type === "MARKET"
+      ? this.resolveLocalMarketOrderRisk(input)
+      : undefined;
+    const riskPrice = marketOrderRisk?.marginPrice ?? input.price;
+
+    if (riskPrice == null || !Number.isFinite(riskPrice) || riskPrice <= 0) {
+      throw new Error("invalid order price");
+    }
+
     const orderId = `order-${this.store.orders.size + 1}`;
     const order: RuntimeOrder = {
       id: orderId,
@@ -127,14 +137,14 @@ export class ExchangeRuntime {
       {
         marketId: input.marketId,
         side: input.side,
-        price: input.price ?? 0,
+        price: riskPrice,
         quantity: input.quantity,
         reduceOnly: input.reduceOnly ?? false,
         estimatedFeeRate: market.takerFeeRate,
         leverage: input.leverage ?? 10,
       },
       [market],
-      [{ marketId: input.marketId, price: input.price ?? 0 }],
+      [{ marketId: input.marketId, price: riskPrice }],
     );
 
     if (!check.ok) {
@@ -155,6 +165,8 @@ export class ExchangeRuntime {
       type: input.type === "MARKET" ? "market" : "limit",
       qtyLots: input.quantity,
       priceTicks: input.price,
+      minPriceTicks: marketOrderRisk?.minExecutionPrice,
+      maxPriceTicks: marketOrderRisk?.maxExecutionPrice,
       timeInForce: input.timeInForce,
       reduceOnly: input.reduceOnly,
       postOnly: input.postOnly,
@@ -196,5 +208,23 @@ export class ExchangeRuntime {
 
   getOrderBookSnapshot(marketId: string, depth?: number) {
     return this.engine.getBookSnapshot(marketId, depth);
+  }
+
+  private resolveLocalMarketOrderRisk(input: SubmitOrderInput): MarketOrderRiskPrice {
+    const orderBook = this.engine.getBookSnapshot(input.marketId);
+    const bestLevel = input.side === "BUY" ? orderBook.asks[0] : orderBook.bids[0];
+
+    if (!bestLevel) {
+      throw new Error("market order insufficient visible liquidity");
+    }
+
+    return estimateMarketOrderRiskPrice({
+      side: input.side,
+      quantity: input.quantity,
+      orderBook,
+      // Local mode has no mark-price service; the best executable level is the
+      // only safe reference available to the demo runtime.
+      markPrice: bestLevel.priceTicks,
+    });
   }
 }

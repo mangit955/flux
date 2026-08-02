@@ -11,6 +11,8 @@ export interface NewOrderCommand {
   type: OrderType;
   qtyLots: number;
   priceTicks?: number;
+  minPriceTicks?: number;
+  maxPriceTicks?: number;
   timeInForce: TimeInForce;
   reduceOnly?: boolean;
   postOnly?: boolean;
