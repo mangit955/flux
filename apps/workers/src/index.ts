@@ -5,6 +5,7 @@ import {
   ProductionPersistenceWorker,
   RedisStreamBus,
   RedisOrderBookCache,
+  type OrderRecoveryClient,
   type OutboxPublisherClient,
 } from "../../../packages/runtime/src/index";
 import { PersistenceService, PrismaPersistenceStore } from "../../../packages/db/src/index";
@@ -164,7 +165,8 @@ async function runProductionWorkers(): Promise<void> {
 }
 
 type WorkerPrismaClient = PrismaClientLike &
-  OutboxPublisherClient & {
+  OutboxPublisherClient &
+  OrderRecoveryClient & {
     market: {
       findMany(args: unknown): Promise<Array<{ id: string }>>;
     };
