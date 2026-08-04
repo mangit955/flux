@@ -95,6 +95,8 @@ describe("PersistenceService", () => {
         "fills.create_many",
         "orders.update_maker_after_trade",
         "orders.update_taker_after_trade",
+        "balance.unlock_maker",
+        "balance.unlock_taker",
         "positions.upsert_maker_after_trade",
         "positions.upsert_taker_after_trade",
         "processed_events.create",

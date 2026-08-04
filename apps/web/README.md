@@ -157,6 +157,6 @@ npm run build
 
 ## Links
 
-- [Deployment Guide](../../DEPLOYMENT.md)
 - [Backend API Docs](../../apps/docs)
-- [Architecture](../../DETAILED_ARCHITECTURE.md)
+- [Architecture](../../CLAUDE.md)
+- [Known issues](../../TODO.md)
