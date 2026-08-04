@@ -407,10 +407,9 @@ PersistenceWorker → Update DB, unlock margin → ACK
 
 ## Related Documentation
 
-- [ORDER_CANCELLATION_FIX.md](../ORDER_CANCELLATION_FIX.md) - Full incident report and fix
-- [QUICK_TROUBLESHOOTING.md](../QUICK_TROUBLESHOOTING.md) - Quick reference guide
-- [DEPLOYMENT.md](../DEPLOYMENT.md) - Deployment procedures
-- [REDIS_ORDERBOOK_CACHE.md](../REDIS_ORDERBOOK_CACHE.md) - Redis architecture
+- [CLAUDE.md](../CLAUDE.md) - Architecture, runtime modes, and order flow
+- [TODO.md](../TODO.md) - Known issues, including the stream traps referenced above
+- [README.md](../README.md) - Setup and verification
 
 ---
 
@@ -421,7 +420,9 @@ If scripts fail or you need help:
 1. Check Railway logs for workers
 2. Verify environment variables are set correctly
 3. Ensure Redis and Database are accessible
-4. Review [ORDER_CANCELLATION_FIX.md](../ORDER_CANCELLATION_FIX.md) for context
+4. Review the "Known traps" section of the `streams-diag` skill
+   (`.claude/skills/streams-diag/SKILL.md`) — dropped commands, the disabled PEL cleanup stub,
+   and the single-matching-worker constraint are the usual causes
 
 **Emergency:** If production is down:
 ```bash
