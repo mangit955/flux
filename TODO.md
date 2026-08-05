@@ -39,6 +39,21 @@ verified locally are marked as such inline rather than stated as fact.
   No service containers needed — the suite runs entirely on the in-memory ports.
   This is what stops #1 and #1b from happening again.
 
+- [x] **2b. Fix `RedisStreamBus.readGroup` silently discarding every message**
+  **Production could not match a single order.** `XREADGROUP` is the one stream reply whose
+  shape depends on the protocol version: RESP2 returns `[[stream, entries], ...]`, RESP3 returns
+  a map keyed by stream name. Bun's Redis client negotiates RESP3, and `decodeXReadGroupRows`
+  began with `if (!Array.isArray(rows)) return result` — so it returned zero messages for
+  commands Redis had already delivered into the PEL. Symptom: `last-delivered-id` advances, the
+  PEL grows, `[MATCHING] Read 0 messages` forever, no errors, and no engine events; submitted
+  orders locked margin and then vanished.
+  The decoder now accepts both shapes. `XRANGE` and `XAUTOCLAIM` return arrays under both
+  protocols and were unaffected — verified against a live Redis 7.
+
+  The existing test passed throughout because it hand-fed the RESP2 array form; there is now a
+  RESP3 case alongside it. Found while running the end-to-end verification for #3/#4/#5, which
+  could not otherwise get a single fill.
+
 ---
 
 ## Tier 1 — Correctness in the money path
