@@ -15,6 +15,14 @@ import type { RuntimeStore } from "./store";
 /** Leverage assumed when the order that opened the position is no longer in the store. */
 const DEFAULT_LEVERAGE = 10;
 
+/** What one side of a trade owes or is owed, once its position has been updated. */
+interface RoleFillOutcome {
+  userId: string;
+  asset: string;
+  fee: number;
+  realizedPnlDelta: number;
+}
+
 // WebSocket hub interface for event publishing
 interface WebSocketPublisher {
   publish(input: {
@@ -237,8 +245,12 @@ export class RuntimePersistenceWorker {
   }
 
   private applyTrade(event: TradeExecuted): void {
-    const makerFill = fillFromTrade(event, "MAKER");
-    const takerFill = fillFromTrade(event, "TAKER");
+    // Positions first: the fill row records the realized PnL that only exists once the position
+    // update has run. Mirrors the ordering in PersistenceService.
+    const maker = this.applyFillToPosition(event, "MAKER");
+    const taker = this.applyFillToPosition(event, "TAKER");
+    const makerFill = fillFromTrade(event, "MAKER", maker);
+    const takerFill = fillFromTrade(event, "TAKER", taker);
 
     this.store.fills.set(makerFill.id, makerFill);
     this.store.fills.set(takerFill.id, takerFill);
@@ -252,15 +264,15 @@ export class RuntimePersistenceWorker {
       remainingQuantity: event.takerOrderRemainingQtyLots,
       updatedAt: event.timestamp,
     });
-    this.applyFillToPosition(event, "MAKER");
-    this.applyFillToPosition(event, "TAKER");
-    
-    // Re-enabled balance changes - this is critical for proper balance updates
-    this.applyTradeBalanceChanges(event, "MAKER");
-    this.applyTradeBalanceChanges(event, "TAKER");
+
+    this.settleRoleFill(event, maker);
+    this.settleRoleFill(event, taker);
   }
 
-  private applyFillToPosition(event: TradeExecuted, role: "MAKER" | "TAKER"): void {
+  private applyFillToPosition(
+    event: TradeExecuted,
+    role: "MAKER" | "TAKER",
+  ): RoleFillOutcome {
     const userId = role === "MAKER" ? event.makerUserId : event.takerUserId;
     const side = role === "MAKER" ? event.makerSide : event.takerSide;
     const market = this.store.markets.get(event.market);
@@ -277,43 +289,43 @@ export class RuntimePersistenceWorker {
         event.market,
         this.store.orders.get(orderId)?.leverage ?? DEFAULT_LEVERAGE,
       );
+    // Charged by liquidity role, not always at the taker rate — providing liquidity is cheaper.
+    const fee =
+      event.priceTicks *
+      event.qtyLots *
+      (role === "MAKER" ? market.makerFeeRate : market.takerFeeRate);
     const fill: FillInput = {
       userId,
       marketId: event.market,
       side: side === "buy" ? "BUY" : "SELL",
       price: event.priceTicks,
       quantity: event.qtyLots,
-      fee: 0,
+      fee,
     };
     const result = applyFillToPosition(existing, fill, market);
     this.store.setPosition(result.next);
+
+    return {
+      userId,
+      asset: market.quoteAsset,
+      fee,
+      realizedPnlDelta: result.realizedPnlDelta,
+    };
   }
 
-  private applyTradeBalanceChanges(event: TradeExecuted, role: "MAKER" | "TAKER"): void {
-    const userId = role === "MAKER" ? event.makerUserId : event.takerUserId;
-    const side = role === "MAKER" ? event.makerSide : event.takerSide;
-    const market = this.store.markets.get(event.market);
-
-    if (!market) {
-      throw new Error(`Unknown market ${event.market}`);
+  /** Credit gross realized PnL and debit the trading fee — the in-memory twin of `settleRoleFill`. */
+  private settleRoleFill(event: TradeExecuted, outcome: RoleFillOutcome): void {
+    if (outcome.realizedPnlDelta !== 0) {
+      this.store.settleBalance(
+        outcome.userId,
+        outcome.asset,
+        outcome.realizedPnlDelta,
+      );
     }
 
-    const tradeValue = event.priceTicks * event.qtyLots;
-    const fee = tradeValue * (role === "MAKER" ? market.makerFeeRate : market.takerFeeRate);
-
-    // For perpetual futures, we only adjust the collateral (quote asset) for fees and realized PnL
-    // The position tracking handles the actual contract exposure
-    
-    // Deduct trading fee from collateral balance
-    const currentBalance = this.store.getBalance(userId, market.quoteAsset);
-    if (currentBalance.total >= fee) {
-      this.store.adjustBalance(userId, market.quoteAsset, -fee);
-    } else {
-      console.warn(`Insufficient balance for trading fee: user ${userId}, required ${fee}, available ${currentBalance.total}`);
+    if (outcome.fee > 0) {
+      this.store.settleBalance(outcome.userId, outcome.asset, -outcome.fee);
     }
-    
-    // For perpetual futures, PnL is realized when positions are reduced
-    // This is handled in the position management logic
   }
 
   private updateOrder(orderId: string, patch: Partial<RuntimeOrder>): void {
@@ -325,14 +337,14 @@ export class RuntimePersistenceWorker {
   }
 }
 
-function fillFromTrade(event: TradeExecuted, role: "MAKER" | "TAKER"): RuntimeFill {
+function fillFromTrade(
+  event: TradeExecuted,
+  role: "MAKER" | "TAKER",
+  outcome: RoleFillOutcome,
+): RuntimeFill {
   const maker = role === "MAKER";
   const side = maker ? event.makerSide : event.takerSide;
   const tradeValue = event.priceTicks * event.qtyLots;
-  
-  // Note: Fee calculation requires market data, which isn't available here
-  // This will be updated in the applyTradeBalanceChanges method
-  const fee = 0; // Placeholder - actual fee deducted in balance changes
 
   return {
     id: `${event.tradeId}:${role.toLowerCase()}`,
@@ -345,8 +357,8 @@ function fillFromTrade(event: TradeExecuted, role: "MAKER" | "TAKER"): RuntimeFi
     price: event.priceTicks,
     quantity: event.qtyLots,
     notional: tradeValue,
-    fee: fee,
-    realizedPnl: 0,
+    fee: outcome.fee,
+    realizedPnl: outcome.realizedPnlDelta,
     createdAt: event.timestamp,
   };
 }

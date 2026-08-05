@@ -142,12 +142,24 @@ export class PersistenceService {
         return ["orders.mark_expired", "balance.unlock"];
 
       case "trade.executed":
-        await tx.createFills(fillsFromTrade(event));
+        const market = await tx.findMarket(event.market);
+
+        if (!market) {
+          throw new Error(`market not found: ${event.market}`);
+        }
 
         // Read both orders once: the release path clears lockedMargin, and the position
         // mapping needs the leverage the order was submitted with.
         const makerOrder = await tx.findOrder(event.makerOrderId);
         const takerOrder = await tx.findOrder(event.takerOrderId);
+        const riskConfig = marketToRiskConfig(market);
+
+        // Positions are applied before the fills are written, because the fill row records the
+        // realized PnL that only exists once the position update has run.
+        const maker = await applyRoleFillToPosition(tx, event, "MAKER", riskConfig, makerOrder);
+        const taker = await applyRoleFillToPosition(tx, event, "TAKER", riskConfig, takerOrder);
+
+        await tx.createFills(fillsFromTrade(event, maker, taker));
 
         const makerStatus = orderStatusFromRemaining(event.makerOrderRemainingQtyLots);
         await tx.updateOrderStatus({
@@ -173,15 +185,21 @@ export class PersistenceService {
           await releaseOrderMargin(tx, takerOrder, event.market, new Date(event.timestamp));
         }
 
-        await applyTradeToPositions(tx, event, makerOrder, takerOrder);
+        // Settle last, so the margin released above has already lowered `locked` by the time
+        // `total` moves.
+        await settleRoleFill(tx, event, "MAKER", market.quoteAsset, maker);
+        await settleRoleFill(tx, event, "TAKER", market.quoteAsset, taker);
+
         return [
+          "positions.upsert_maker_after_trade",
+          "positions.upsert_taker_after_trade",
           "fills.create_many",
           "orders.update_maker_after_trade",
           "orders.update_taker_after_trade",
           "balance.unlock_maker",
           "balance.unlock_taker",
-          "positions.upsert_maker_after_trade",
-          "positions.upsert_taker_after_trade",
+          "balance.settle_maker",
+          "balance.settle_taker",
         ];
     }
   }
@@ -222,20 +240,11 @@ async function releaseOrderMargin(
   await tx.clearOrderLockedMargin(order.id, updatedAt);
 }
 
-async function applyTradeToPositions(
-  tx: PersistenceTransaction,
-  event: TradeExecuted,
-  makerOrder: OrderWrite | null,
-  takerOrder: OrderWrite | null,
-): Promise<void> {
-  const market = await tx.findMarket(event.market);
-
-  if (!market) {
-    throw new Error(`market not found: ${event.market}`);
-  }
-
-  await applyRoleFillToPosition(tx, event, "MAKER", marketToRiskConfig(market), makerOrder);
-  await applyRoleFillToPosition(tx, event, "TAKER", marketToRiskConfig(market), takerOrder);
+/** What one side of a trade owes or is owed, once its position has been updated. */
+interface RoleFillOutcome {
+  userId: string;
+  fee: number;
+  realizedPnlDelta: number;
 }
 
 async function applyRoleFillToPosition(
@@ -244,23 +253,82 @@ async function applyRoleFillToPosition(
   role: "MAKER" | "TAKER",
   market: MarketRiskConfig,
   order: OrderWrite | null,
-): Promise<void> {
+): Promise<RoleFillOutcome> {
   const userId = role === "MAKER" ? event.makerUserId : event.takerUserId;
   const side = role === "MAKER" ? event.makerSide : event.takerSide;
   const existing = positionFromWrite(
     await tx.findPosition(userId, event.market),
   ) ?? emptyPosition(userId, event.market, order?.leverage ?? DEFAULT_LEVERAGE);
+  // Charged by liquidity role, not always at the taker rate — providing liquidity is cheaper.
+  const fee =
+    event.priceTicks *
+    event.qtyLots *
+    (role === "MAKER" ? market.makerFeeRate : market.takerFeeRate);
   const fill: FillInput = {
     userId,
     marketId: event.market,
     side: side === "buy" ? "BUY" : "SELL",
     price: event.priceTicks,
     quantity: event.qtyLots,
-    fee: 0,
+    fee,
   };
+  // `applyFillToPosition` subtracts the fee into `position.realizedPnl`, so the position row
+  // records PnL net of fees while `realizedPnlDelta` stays gross.
   const result = applyFillToPosition(existing, fill, market);
 
   await tx.upsertPosition(positionToWrite(result.next, new Date(event.timestamp)));
+
+  return { userId, fee, realizedPnlDelta: result.realizedPnlDelta };
+}
+
+/**
+ * Move the money a fill actually produced: credit gross realized PnL, debit the trading fee,
+ * and record both in the ledger. Without this the exchange collects nothing and a user who
+ * closes a winning position receives nothing spendable.
+ */
+async function settleRoleFill(
+  tx: PersistenceTransaction,
+  event: TradeExecuted,
+  role: "MAKER" | "TAKER",
+  asset: string,
+  outcome: RoleFillOutcome,
+): Promise<void> {
+  const fillId = `${event.tradeId}:${role.toLowerCase()}`;
+  const createdAt = new Date(event.timestamp);
+
+  if (outcome.realizedPnlDelta !== 0) {
+    const balanceAfter = await tx.adjustBalanceTotal(
+      outcome.userId,
+      asset,
+      outcome.realizedPnlDelta,
+    );
+
+    await tx.createLedgerEntry({
+      id: `${fillId}:pnl`,
+      userId: outcome.userId,
+      asset,
+      type: "REALIZED_PNL",
+      amount: decimalString(outcome.realizedPnlDelta),
+      balanceAfter: decimalString(balanceAfter),
+      referenceId: fillId,
+      createdAt,
+    });
+  }
+
+  if (outcome.fee > 0) {
+    const balanceAfter = await tx.adjustBalanceTotal(outcome.userId, asset, -outcome.fee);
+
+    await tx.createLedgerEntry({
+      id: `${fillId}:fee`,
+      userId: outcome.userId,
+      asset,
+      type: "TRADING_FEE",
+      amount: decimalString(-outcome.fee),
+      balanceAfter: decimalString(balanceAfter),
+      referenceId: fillId,
+      createdAt,
+    });
+  }
 }
 
 function processedEventFromEngineEvent(
@@ -301,7 +369,11 @@ function orderWriteFromRestedEvent(
   };
 }
 
-function fillsFromTrade(event: TradeExecuted): FillWrite[] {
+function fillsFromTrade(
+  event: TradeExecuted,
+  maker: RoleFillOutcome,
+  taker: RoleFillOutcome,
+): FillWrite[] {
   const createdAt = new Date(event.timestamp);
   const price = decimalString(event.priceTicks);
   const quantity = decimalString(event.qtyLots);
@@ -319,8 +391,8 @@ function fillsFromTrade(event: TradeExecuted): FillWrite[] {
       price,
       quantity,
       notional,
-      fee: "0",
-      realizedPnl: "0",
+      fee: decimalString(maker.fee),
+      realizedPnl: decimalString(maker.realizedPnlDelta),
       eventId: event.eventId,
       createdAt,
     },
@@ -335,8 +407,8 @@ function fillsFromTrade(event: TradeExecuted): FillWrite[] {
       price,
       quantity,
       notional,
-      fee: "0",
-      realizedPnl: "0",
+      fee: decimalString(taker.fee),
+      realizedPnl: decimalString(taker.realizedPnlDelta),
       eventId: event.eventId,
       createdAt,
     },

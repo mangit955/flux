@@ -1,5 +1,6 @@
 import type {
   FillWrite,
+  LedgerEntryWrite,
   MarketWrite,
   OrderStatusUpdate,
   OrderWrite,
@@ -25,6 +26,7 @@ export interface InMemoryPersistenceState {
   markets: Map<string, MarketWrite>;
   positions: Map<string, PositionWrite>;
   balances: Map<string, InMemoryBalance>;
+  ledgerEntries: Map<string, LedgerEntryWrite>;
 }
 
 export class InMemoryPersistenceStore implements PersistenceStore {
@@ -50,6 +52,7 @@ export class InMemoryPersistenceStore implements PersistenceStore {
     ]),
     positions: new Map(),
     balances: new Map(),
+    ledgerEntries: new Map(),
   };
 
   async transaction<T>(
@@ -64,6 +67,7 @@ export class InMemoryPersistenceStore implements PersistenceStore {
     this.state.markets = draft.markets;
     this.state.positions = draft.positions;
     this.state.balances = draft.balances;
+    this.state.ledgerEntries = draft.ledgerEntries;
 
     return result;
   }
@@ -185,6 +189,38 @@ class InMemoryPersistenceTransaction implements PersistenceTransaction {
     });
   }
 
+  async adjustBalanceTotal(
+    userId: string,
+    asset: string,
+    delta: number,
+  ): Promise<number> {
+    const key = balanceKey(userId, asset);
+    const existing = this.state.balances.get(key) ?? {
+      userId,
+      asset,
+      total: 0,
+      locked: 0,
+    };
+    const total = Number((existing.total + delta).toFixed(12));
+
+    if (total < 0) {
+      console.error(
+        `balance went negative for user ${userId} ${asset}: ${total} after ${delta}`,
+      );
+    }
+
+    this.state.balances.set(key, { ...existing, total });
+
+    return total;
+  }
+
+  async createLedgerEntry(entry: LedgerEntryWrite): Promise<void> {
+    this.state.ledgerEntries.set(entry.id, {
+      ...entry,
+      createdAt: new Date(entry.createdAt),
+    });
+  }
+
   async clearOrderLockedMargin(orderId: string, updatedAt: Date): Promise<void> {
     const existing = this.state.orders.get(orderId);
 
@@ -225,6 +261,12 @@ function cloneState(state: InMemoryPersistenceState): InMemoryPersistenceState {
     ),
     balances: new Map(
       [...state.balances.entries()].map(([id, balance]) => [id, { ...balance }]),
+    ),
+    ledgerEntries: new Map(
+      [...state.ledgerEntries.entries()].map(([id, entry]) => [
+        id,
+        { ...entry, createdAt: new Date(entry.createdAt) },
+      ]),
     ),
   };
 }

@@ -1,5 +1,6 @@
 import type {
   FillWrite,
+  LedgerEntryWrite,
   MarketWrite,
   OrderStatusUpdate,
   OrderWrite,
@@ -18,6 +19,9 @@ export interface PrismaClientLike {
 }
 
 export interface PrismaTransactionLike {
+  /** Returns the number of affected rows. */
+  $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
+  $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T[]>;
   processedEvent: {
     findUnique(args: { where: { eventId: string } }): Promise<unknown | null>;
     create(args: { data: ProcessedEventWrite }): Promise<unknown>;
@@ -58,6 +62,9 @@ export interface PrismaTransactionLike {
       where: { userId_asset: { userId: string; asset: string } };
     }): Promise<unknown | null>;
     update(args: unknown): Promise<unknown>;
+  };
+  ledgerEntry: {
+    create(args: { data: LedgerEntryWrite }): Promise<unknown>;
   };
 }
 
@@ -243,47 +250,80 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
       return;
     }
 
-    const balance = await this.tx.balance.findUnique({
-      where: {
-        userId_asset: {
-          userId,
-          asset,
-        },
-      },
-    });
+    // Read and write in one statement, for the same reason the lock side does: a
+    // read-modify-write on `locked` loses concurrent updates. The CTE takes the row lock and
+    // still hands back the previous value, which is what makes the drift check below possible.
+    const rows = await this.tx.$queryRawUnsafe<{ lockedBefore: unknown }>(
+      `WITH prev AS (
+         SELECT "id", "locked" FROM "balances"
+          WHERE "userId" = $2 AND "asset" = $3
+          FOR UPDATE
+       )
+       UPDATE "balances" b
+          SET "locked" = GREATEST(0, prev."locked" - $1::numeric), "updatedAt" = NOW()
+         FROM prev
+        WHERE b."id" = prev."id"
+       RETURNING prev."locked" AS "lockedBefore"`,
+      String(amount),
+      userId,
+      asset,
+    );
 
-    if (!balance) {
+    if (rows.length === 0) {
       console.warn(`⚠️  Balance not found for user ${userId}, asset ${asset}`);
       return;
     }
 
-    const currentLocked = Number((balance as { locked: unknown }).locked);
+    const lockedBefore = Number(rows[0]?.lockedBefore ?? 0);
 
-    if (amount > currentLocked) {
-      // The release amount is now the value recorded on the order, so a mismatch means the
-      // locked column drifted from the orders that own it. Clamping hides that; log it loudly.
+    if (amount > lockedBefore) {
+      // The release amount is the value recorded on the order, so a mismatch means the locked
+      // column drifted from the orders that own it. Clamping hides that; log it loudly.
       // Throwing would be better, but the persistence worker acks on failure (TODO #11), so a
       // throw drops the event and strands the margin with no alarm at all.
       console.error(
-        `margin release exceeds locked balance for user ${userId} ${asset}: releasing ${amount}, locked ${currentLocked}`,
+        `margin release exceeds locked balance for user ${userId} ${asset}: releasing ${amount}, locked ${lockedBefore}`,
       );
     }
 
-    const newLocked = Math.max(0, currentLocked - amount);
+    console.log(`🔓 Unlocked ${amount.toFixed(2)} ${asset} for user ${userId}`);
+  }
 
-    await this.tx.balance.update({
-      where: {
-        userId_asset: {
-          userId,
-          asset,
-        },
-      },
-      data: {
-        locked: String(newLocked),
-      },
-    });
+  async adjustBalanceTotal(
+    userId: string,
+    asset: string,
+    delta: number,
+  ): Promise<number> {
+    // Upsert, because a user can be credited before ever holding a row for the asset. Raw SQL
+    // cannot lean on Prisma's @default(cuid()), so the id is supplied here.
+    const rows = await this.tx.$queryRawUnsafe<{ total: unknown }>(
+      `INSERT INTO "balances" ("id","userId","asset","total","locked","createdAt","updatedAt")
+       VALUES ($1, $2, $3, $4::numeric, 0, NOW(), NOW())
+       ON CONFLICT ("userId","asset")
+       DO UPDATE SET "total" = "balances"."total" + EXCLUDED."total", "updatedAt" = NOW()
+       RETURNING "total"`,
+      crypto.randomUUID(),
+      userId,
+      asset,
+      String(delta),
+    );
 
-    console.log(`🔓 Unlocked ${amount.toFixed(2)} ${asset} for user ${userId} (remaining locked: ${newLocked.toFixed(2)})`);
+    const total = Number(rows[0]?.total ?? 0);
+
+    if (total < 0) {
+      // Bad debt: losses exceeded collateral. Recorded rather than refused — clamping would
+      // silently forgive the shortfall, and throwing would drop the fill entirely (TODO #11).
+      // The liquidation engine and insurance fund (TODO #12) are what resolve this.
+      console.error(
+        `balance went negative for user ${userId} ${asset}: ${total} after ${delta}`,
+      );
+    }
+
+    return total;
+  }
+
+  async createLedgerEntry(entry: LedgerEntryWrite): Promise<void> {
+    await this.tx.ledgerEntry.create({ data: entry });
   }
 
   async clearOrderLockedMargin(orderId: string, updatedAt: Date): Promise<void> {

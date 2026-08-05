@@ -16,6 +16,16 @@ export type DurableOrderStatus =
   | "REJECTED"
   | "EXPIRED";
 export type DurableLiquidityRole = "MAKER" | "TAKER";
+export type DurableLedgerEntryType =
+  | "DEPOSIT"
+  | "WITHDRAW"
+  | "TRADING_FEE"
+  | "REALIZED_PNL"
+  | "FUNDING_PAYMENT"
+  | "LIQUIDATION_LOSS"
+  | "INSURANCE_FUND_TRANSFER"
+  | "INSURANCE_FUND_CREDIT"
+  | "ADL_SETTLEMENT";
 export type OutboxEventStatus = "PENDING" | "PUBLISHED" | "FAILED";
 export type DurableLiquidationStatus =
   | "TRIGGERED"
@@ -68,6 +78,17 @@ export interface FillWrite {
   fee: string;
   realizedPnl: string;
   eventId: string;
+  createdAt: Date;
+}
+
+export interface LedgerEntryWrite {
+  id: string;
+  userId: string;
+  asset: string;
+  type: DurableLedgerEntryType;
+  amount: string;
+  balanceAfter: string;
+  referenceId?: string | null;
   createdAt: Date;
 }
 
