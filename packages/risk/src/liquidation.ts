@@ -1,3 +1,4 @@
+import { Decimal, ZERO, money, type Money } from "./decimal";
 import { calculateMarginSummary } from "./margin";
 import { calculateUnrealizedPnl, positionNotional } from "./position-engine";
 import type {
@@ -21,15 +22,15 @@ export interface CreateLiquidationTriggerInput {
   markets: MarketRiskConfig[];
   markPrices: MarkPrice[];
   createdAt: number;
-  slippageBufferRate?: number;
+  slippageBufferRate?: Money;
 }
 
 export interface SettleDeficitInput {
   asset: string;
-  deficit: number;
+  deficit: Money;
   insuranceFund: InsuranceFund;
   liquidatedPosition: Position;
-  markPrice: number;
+  markPrice: Money;
   adlCandidates: AdlCandidate[];
 }
 
@@ -43,8 +44,8 @@ export function createLiquidationTriggers(
   );
 
   if (
-    summary.maintenanceMargin === 0 ||
-    summary.accountEquity > summary.maintenanceMargin
+    summary.maintenanceMargin.isZero() ||
+    summary.accountEquity.gt(summary.maintenanceMargin)
   ) {
     return [];
   }
@@ -52,14 +53,14 @@ export function createLiquidationTriggers(
   const triggers: LiquidationTrigger[] = [];
 
   for (const position of input.account.positions) {
-    if (position.quantity === 0) {
+    if (position.quantity.isZero()) {
       continue;
     }
 
     const market = requireMarket(input.markets, position.marketId);
     const markPrice = requireMarkPrice(input.markPrices, position.marketId);
     const notional = positionNotional(position, markPrice);
-    const maintenanceMargin = notional * market.maintenanceMarginRate;
+    const maintenanceMargin = notional.mul(market.maintenanceMarginRate);
 
     triggers.push({
       eventId: `${input.eventId}:${position.marketId}`,
@@ -67,7 +68,7 @@ export function createLiquidationTriggers(
       marketId: position.marketId,
       positionQuantity: position.quantity,
       markPrice,
-      maintenanceMargin: roundFinancial(maintenanceMargin),
+      maintenanceMargin,
       accountEquity: summary.accountEquity,
       status: "TRIGGERED",
       order: createLiquidationOrder({
@@ -75,7 +76,7 @@ export function createLiquidationTriggers(
         userId: input.account.userId,
         position,
         markPrice,
-        slippageBufferRate: input.slippageBufferRate ?? 0.005,
+        slippageBufferRate: input.slippageBufferRate ?? money("0.005"),
       }),
       createdAt: input.createdAt,
     });
@@ -88,45 +89,44 @@ export function createLiquidationOrder(input: {
   eventId: string;
   userId: string;
   position: Position;
-  markPrice: number;
-  slippageBufferRate: number;
+  markPrice: Money;
+  slippageBufferRate: Money;
 }): LiquidationOrder {
-  if (input.position.quantity === 0) {
+  if (input.position.quantity.isZero()) {
     throw new Error("cannot liquidate a flat position");
   }
 
-  const side: TradeSide = input.position.quantity > 0 ? "SELL" : "BUY";
+  const side: TradeSide = input.position.quantity.gt(ZERO) ? "SELL" : "BUY";
   const priceMultiplier =
     side === "SELL"
-      ? 1 - input.slippageBufferRate
-      : 1 + input.slippageBufferRate;
+      ? money(1).sub(input.slippageBufferRate)
+      : money(1).add(input.slippageBufferRate);
 
   return {
     orderId: `${input.eventId}:${input.position.marketId}:liquidation-order`,
     userId: input.userId,
     marketId: input.position.marketId,
     side,
-    quantity: Math.abs(input.position.quantity),
-    limitPrice: roundFinancial(input.markPrice * priceMultiplier),
+    quantity: input.position.quantity.abs(),
+    limitPrice: input.markPrice.mul(priceMultiplier),
     reduceOnly: true,
   };
 }
 
 export function useInsuranceFund(
   fund: InsuranceFund,
-  requestedDeficit: number,
+  requestedDeficit: Money,
 ): InsuranceFundUsage {
   assertNonNegative(requestedDeficit, "requested deficit");
 
-  const used = Math.min(fund.balance, requestedDeficit);
-  const remainingDeficit = requestedDeficit - used;
+  const used = Decimal.min(fund.balance, requestedDeficit);
 
   return {
     asset: fund.asset,
-    requested: roundFinancial(requestedDeficit),
-    used: roundFinancial(used),
-    remainingDeficit: roundFinancial(remainingDeficit),
-    nextFundBalance: roundFinancial(fund.balance - used),
+    requested: requestedDeficit,
+    used,
+    remainingDeficit: requestedDeficit.sub(used),
+    nextFundBalance: fund.balance.sub(used),
   };
 }
 
@@ -141,16 +141,16 @@ export function settleLiquidationDeficit(
 
   const insuranceFund = useInsuranceFund(input.insuranceFund, input.deficit);
 
-  if (insuranceFund.remainingDeficit === 0) {
+  if (insuranceFund.remainingDeficit.isZero()) {
     return {
       insuranceFund,
       adlActions: [],
-      unresolvedDeficit: 0,
+      unresolvedDeficit: ZERO,
       status: "INSURANCE_FUND_USED",
     };
   }
 
-  const adlQuantity = insuranceFund.remainingDeficit / input.markPrice;
+  const adlQuantity = insuranceFund.remainingDeficit.div(input.markPrice);
   const adlActions = createAdlActions({
     liquidatedPosition: input.liquidatedPosition,
     markPrice: input.markPrice,
@@ -158,97 +158,108 @@ export function settleLiquidationDeficit(
     candidates: input.adlCandidates,
   });
   const coveredByAdl = adlActions.reduce(
-    (sum, action) => sum + action.quantity * action.price,
-    0,
+    (sum, action) => sum.add(action.quantity.mul(action.price)),
+    ZERO,
   );
-  const unresolvedDeficit = Math.max(
-    0,
-    insuranceFund.remainingDeficit - coveredByAdl,
+  const unresolvedDeficit = Decimal.max(
+    ZERO,
+    insuranceFund.remainingDeficit.sub(coveredByAdl),
   );
 
   return {
     insuranceFund,
     adlActions,
-    unresolvedDeficit: roundFinancial(unresolvedDeficit),
-    status: unresolvedDeficit === 0 ? "ADL_USED" : "FAILED",
+    unresolvedDeficit,
+    status: unresolvedDeficit.isZero() ? "ADL_USED" : "FAILED",
   };
 }
 
 export function createAdlActions(input: {
   liquidatedPosition: Position;
-  markPrice: number;
-  quantityToReduce: number;
+  markPrice: Money;
+  quantityToReduce: Money;
   candidates: AdlCandidate[];
 }): AdlAction[] {
   assertNonNegative(input.quantityToReduce, "ADL quantity");
 
-  if (input.liquidatedPosition.quantity === 0 || input.quantityToReduce === 0) {
+  if (
+    input.liquidatedPosition.quantity.isZero() ||
+    input.quantityToReduce.isZero()
+  ) {
     return [];
   }
 
-  const requiredOppositeSign = -Math.sign(input.liquidatedPosition.quantity);
+  const requiredOppositeSign = -input.liquidatedPosition.quantity.s;
   const rankedCandidates = input.candidates
     .filter(
       (candidate) =>
         candidate.position.marketId === input.liquidatedPosition.marketId &&
-        Math.sign(candidate.position.quantity) === requiredOppositeSign,
+        !candidate.position.quantity.isZero() &&
+        candidate.position.quantity.s === requiredOppositeSign,
     )
     .map((candidate) => ({
       candidate,
       score: calculateAdlScore(candidate),
     }))
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.score.cmp(a.score));
 
   const actions: AdlAction[] = [];
   let remainingQuantity = input.quantityToReduce;
 
   for (const ranked of rankedCandidates) {
-    if (remainingQuantity <= 0) {
+    if (remainingQuantity.lte(ZERO)) {
       break;
     }
 
-    const reducibleQuantity = Math.min(
-      Math.abs(ranked.candidate.position.quantity),
+    const reducibleQuantity = Decimal.min(
+      ranked.candidate.position.quantity.abs(),
       remainingQuantity,
     );
 
-    if (reducibleQuantity <= 0) {
+    if (reducibleQuantity.lte(ZERO)) {
       continue;
     }
 
     actions.push({
       userId: ranked.candidate.userId,
       marketId: ranked.candidate.position.marketId,
-      side: ranked.candidate.position.quantity > 0 ? "SELL" : "BUY",
-      quantity: roundFinancial(reducibleQuantity),
+      side: ranked.candidate.position.quantity.gt(ZERO) ? "SELL" : "BUY",
+      quantity: reducibleQuantity,
       price: input.markPrice,
-      score: roundFinancial(ranked.score),
+      score: ranked.score,
     });
 
-    remainingQuantity -= reducibleQuantity;
+    remainingQuantity = remainingQuantity.sub(reducibleQuantity);
   }
 
   return actions;
 }
 
-export function calculateAdlScore(candidate: AdlCandidate): number {
+export function calculateAdlScore(candidate: AdlCandidate): Money {
   const notional = positionNotional(candidate.position, candidate.markPrice);
 
-  if (notional === 0) {
-    return 0;
+  if (notional.isZero()) {
+    return ZERO;
   }
 
   const unrealizedPnl = calculateUnrealizedPnl(
     candidate.position,
     candidate.markPrice,
   );
-  const pnlPercent = unrealizedPnl / Math.abs(
-    candidate.position.entryPrice * candidate.position.quantity,
-  );
-  const equityFloor = Math.max(candidate.accountEquity, 1e-9);
-  const effectiveLeverage = notional / equityFloor;
+  const costBasis = candidate.position.entryPrice
+    .mul(candidate.position.quantity)
+    .abs();
 
-  return roundFinancial(pnlPercent * effectiveLeverage);
+  if (costBasis.isZero()) {
+    return ZERO;
+  }
+
+  const pnlPercent = unrealizedPnl.div(costBasis);
+  // Floor the divisor so a wiped-out account does not divide by zero.
+  const equityFloor = Decimal.max(candidate.accountEquity, money("1e-9"));
+  const effectiveLeverage = notional.div(equityFloor);
+
+  return pnlPercent.mul(effectiveLeverage);
 }
 
 function requireMarket(
@@ -264,7 +275,7 @@ function requireMarket(
   return market;
 }
 
-function requireMarkPrice(markPrices: MarkPrice[], marketId: string): number {
+function requireMarkPrice(markPrices: MarkPrice[], marketId: string): Money {
   const markPrice = markPrices.find(
     (candidate) => candidate.marketId === marketId,
   );
@@ -276,12 +287,8 @@ function requireMarkPrice(markPrices: MarkPrice[], marketId: string): number {
   return markPrice.price;
 }
 
-function assertNonNegative(value: number, label: string): void {
-  if (!Number.isFinite(value) || value < 0) {
+function assertNonNegative(value: Money, label: string): void {
+  if (!value.isFinite() || value.lt(ZERO)) {
     throw new Error(`${label} must be non-negative`);
   }
-}
-
-function roundFinancial(value: number): number {
-  return Number(value.toFixed(12));
 }

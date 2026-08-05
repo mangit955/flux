@@ -1,3 +1,5 @@
+import type { Money } from "./decimal";
+
 export type PositionSide = "LONG" | "SHORT" | "FLAT";
 export type TradeSide = "BUY" | "SELL";
 export type LedgerEntryType =
@@ -19,61 +21,61 @@ export type LiquidationStatus =
 
 export interface MarketRiskConfig {
   marketId: string;
-  tickSize: number;
-  lotSize: number;
+  tickSize: Money;
+  lotSize: Money;
   maxLeverage: number;
-  initialMarginRate: number;
-  maintenanceMarginRate: number;
-  makerFeeRate: number;
-  takerFeeRate: number;
+  initialMarginRate: Money;
+  maintenanceMarginRate: Money;
+  makerFeeRate: Money;
+  takerFeeRate: Money;
 }
 
 export interface FundingMarketConfig {
   marketId: string;
   fundingIntervalHours: number;
-  fundingRateCap: number;
+  fundingRateCap: Money;
 }
 
 export interface Position {
   userId: string;
   marketId: string;
-  quantity: number;
-  entryPrice: number;
-  realizedPnl: number;
+  quantity: Money;
+  entryPrice: Money;
+  realizedPnl: Money;
   leverage: number;
 }
 
 export interface PositionView extends Position {
   side: PositionSide;
-  notional: number;
-  unrealizedPnl: number;
-  initialMargin: number;
-  maintenanceMargin: number;
+  notional: Money;
+  unrealizedPnl: Money;
+  initialMargin: Money;
+  maintenanceMargin: Money;
 }
 
 export interface FillInput {
   userId: string;
   marketId: string;
   side: TradeSide;
-  price: number;
-  quantity: number;
-  fee: number;
+  price: Money;
+  quantity: Money;
+  fee: Money;
 }
 
 export interface PositionUpdateResult {
   previous: Position;
   next: Position;
-  closedQuantity: number;
-  openedQuantity: number;
-  realizedPnlDelta: number;
-  feePaid: number;
+  closedQuantity: Money;
+  openedQuantity: Money;
+  realizedPnlDelta: Money;
+  feePaid: Money;
 }
 
 export interface Balance {
   userId: string;
   asset: string;
-  total: number;
-  locked: number;
+  total: Money;
+  locked: Money;
 }
 
 export interface LedgerEntry {
@@ -81,8 +83,8 @@ export interface LedgerEntry {
   userId: string;
   asset: string;
   type: LedgerEntryType;
-  amount: number;
-  balanceAfter: number;
+  amount: Money;
+  balanceAfter: Money;
   referenceId?: string;
   createdAt: number;
 }
@@ -90,7 +92,7 @@ export interface LedgerEntry {
 export interface AccountState {
   userId: string;
   collateralAsset: string;
-  walletBalance: number;
+  walletBalance: Money;
   positions: Position[];
   openOrders: OpenOrderRisk[];
 }
@@ -98,22 +100,22 @@ export interface AccountState {
 export interface OpenOrderRisk {
   marketId: string;
   side: TradeSide;
-  price: number;
-  quantity: number;
+  price: Money;
+  quantity: Money;
   reduceOnly: boolean;
-  estimatedFeeRate: number;
+  estimatedFeeRate: Money;
   leverage: number;
 }
 
 export interface MarkPrice {
   marketId: string;
-  price: number;
+  price: Money;
 }
 
 export interface FundingPriceInput {
   marketId: string;
-  markPrice: number;
-  indexPrice: number;
+  markPrice: Money;
+  indexPrice: Money;
   timestamp: number;
 }
 
@@ -122,21 +124,21 @@ export interface FundingPayment {
   eventId: string;
   userId: string;
   marketId: string;
-  positionQuantity: number;
-  markPrice: number;
-  indexPrice: number;
-  fundingRate: number;
-  paymentAmount: number;
+  positionQuantity: Money;
+  markPrice: Money;
+  indexPrice: Money;
+  fundingRate: Money;
+  paymentAmount: Money;
   fundingTime: number;
 }
 
 export interface FundingExecution {
   eventId: string;
   marketId: string;
-  markPrice: number;
-  indexPrice: number;
-  premiumIndex: number;
-  fundingRate: number;
+  markPrice: Money;
+  indexPrice: Money;
+  premiumIndex: Money;
+  fundingRate: Money;
   fundingTime: number;
   payments: FundingPayment[];
 }
@@ -144,22 +146,22 @@ export interface FundingExecution {
 export interface MarginSummary {
   userId: string;
   collateralAsset: string;
-  walletBalance: number;
-  unrealizedPnl: number;
-  accountEquity: number;
-  initialMargin: number;
-  maintenanceMargin: number;
-  openOrderInitialMargin: number;
-  openOrderFees: number;
-  availableMargin: number;
-  marginRatio: number | null;
+  walletBalance: Money;
+  unrealizedPnl: Money;
+  accountEquity: Money;
+  initialMargin: Money;
+  maintenanceMargin: Money;
+  openOrderInitialMargin: Money;
+  openOrderFees: Money;
+  availableMargin: Money;
+  marginRatio: Money | null;
 }
 
 export interface OrderMarginCheck {
   ok: boolean;
-  requiredInitialMargin: number;
-  requiredFee: number;
-  availableMargin: number;
+  requiredInitialMargin: Money;
+  requiredFee: Money;
+  availableMargin: Money;
   reason?: "INSUFFICIENT_MARGIN" | "INVALID_LEVERAGE" | "UNKNOWN_MARKET";
 }
 
@@ -168,8 +170,8 @@ export interface LiquidationOrder {
   userId: string;
   marketId: string;
   side: TradeSide;
-  quantity: number;
-  limitPrice: number;
+  quantity: Money;
+  limitPrice: Money;
   reduceOnly: true;
 }
 
@@ -177,10 +179,10 @@ export interface LiquidationTrigger {
   eventId: string;
   userId: string;
   marketId: string;
-  positionQuantity: number;
-  markPrice: number;
-  maintenanceMargin: number;
-  accountEquity: number;
+  positionQuantity: Money;
+  markPrice: Money;
+  maintenanceMargin: Money;
+  accountEquity: Money;
   status: LiquidationStatus;
   order: LiquidationOrder;
   createdAt: number;
@@ -188,36 +190,36 @@ export interface LiquidationTrigger {
 
 export interface InsuranceFund {
   asset: string;
-  balance: number;
+  balance: Money;
 }
 
 export interface InsuranceFundUsage {
   asset: string;
-  requested: number;
-  used: number;
-  remainingDeficit: number;
-  nextFundBalance: number;
+  requested: Money;
+  used: Money;
+  remainingDeficit: Money;
+  nextFundBalance: Money;
 }
 
 export interface AdlCandidate {
   userId: string;
   position: Position;
-  markPrice: number;
-  accountEquity: number;
+  markPrice: Money;
+  accountEquity: Money;
 }
 
 export interface AdlAction {
   userId: string;
   marketId: string;
   side: TradeSide;
-  quantity: number;
-  price: number;
-  score: number;
+  quantity: Money;
+  price: Money;
+  score: Money;
 }
 
 export interface DeficitSettlement {
   insuranceFund: InsuranceFundUsage;
   adlActions: AdlAction[];
-  unresolvedDeficit: number;
+  unresolvedDeficit: Money;
   status: "INSURANCE_FUND_USED" | "ADL_USED" | "FAILED";
 }

@@ -1,10 +1,11 @@
+import { ZERO, type Money } from "./decimal";
 import type { Balance, LedgerEntry, LedgerEntryType } from "./types";
 
 export interface ApplyLedgerEntryInput {
   id: string;
   balance: Balance;
   type: LedgerEntryType;
-  amount: number;
+  amount: Money;
   referenceId?: string;
   createdAt: number;
 }
@@ -17,9 +18,9 @@ export interface ApplyLedgerEntryResult {
 export function applyLedgerEntry(
   input: ApplyLedgerEntryInput,
 ): ApplyLedgerEntryResult {
-  const nextTotal = roundFinancial(input.balance.total + input.amount);
+  const nextTotal = input.balance.total.add(input.amount);
 
-  if (nextTotal < 0) {
+  if (nextTotal.isNegative()) {
     throw new Error(
       `ledger entry would make ${input.balance.asset} balance negative`,
     );
@@ -45,42 +46,38 @@ export function applyLedgerEntry(
   };
 }
 
-export function availableBalance(balance: Balance): number {
-  return roundFinancial(balance.total - balance.locked);
+export function availableBalance(balance: Balance): Money {
+  return balance.total.sub(balance.locked);
 }
 
-export function lockBalance(balance: Balance, amount: number): Balance {
+export function lockBalance(balance: Balance, amount: Money): Balance {
   assertNonNegative(amount, "lock amount");
 
-  if (availableBalance(balance) < amount) {
+  if (availableBalance(balance).lt(amount)) {
     throw new Error(`insufficient available ${balance.asset} balance`);
   }
 
   return {
     ...balance,
-    locked: roundFinancial(balance.locked + amount),
+    locked: balance.locked.add(amount),
   };
 }
 
-export function unlockBalance(balance: Balance, amount: number): Balance {
+export function unlockBalance(balance: Balance, amount: Money): Balance {
   assertNonNegative(amount, "unlock amount");
 
-  if (balance.locked < amount) {
+  if (balance.locked.lt(amount)) {
     throw new Error(`cannot unlock more ${balance.asset} than is locked`);
   }
 
   return {
     ...balance,
-    locked: roundFinancial(balance.locked - amount),
+    locked: balance.locked.sub(amount),
   };
 }
 
-function assertNonNegative(value: number, label: string): void {
-  if (!Number.isFinite(value) || value < 0) {
+function assertNonNegative(value: Money, label: string): void {
+  if (!value.isFinite() || value.lt(ZERO)) {
     throw new Error(`${label} must be non-negative`);
   }
-}
-
-function roundFinancial(value: number): number {
-  return Number(value.toFixed(12));
 }

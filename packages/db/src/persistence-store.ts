@@ -1,3 +1,4 @@
+import type { Money } from "../../risk/src/index";
 import type {
   FillWrite,
   LedgerEntryWrite,
@@ -24,9 +25,9 @@ export interface PersistenceTransaction {
   createFills(fills: FillWrite[]): Promise<void>;
   upsertPosition(position: PositionWrite): Promise<void>;
   findOrder(orderId: string): Promise<OrderWrite | null>;
-  unlockBalanceForOrder(userId: string, asset: string, amount: number): Promise<void>;
+  unlockBalanceForOrder(userId: string, asset: string, amount: Money): Promise<void>;
   clearOrderLockedMargin(orderId: string, updatedAt: Date): Promise<void>;
   /** Applies a signed delta to `balance.total`, creating the row if absent. Returns the new total. */
-  adjustBalanceTotal(userId: string, asset: string, delta: number): Promise<number>;
+  adjustBalanceTotal(userId: string, asset: string, delta: Money): Promise<Money>;
   createLedgerEntry(entry: LedgerEntryWrite): Promise<void>;
 }

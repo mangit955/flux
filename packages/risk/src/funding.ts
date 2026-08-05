@@ -1,3 +1,4 @@
+import { Decimal, ZERO, type Money } from "./decimal";
 import type {
   Balance,
   FundingExecution,
@@ -29,22 +30,22 @@ export interface ApplyFundingPaymentsResult {
 }
 
 export function calculatePremiumIndex(
-  markPrice: number,
-  indexPrice: number,
-): number {
+  markPrice: Money,
+  indexPrice: Money,
+): Money {
   assertPositive(markPrice, "mark price");
   assertPositive(indexPrice, "index price");
 
-  return roundFinancial((markPrice - indexPrice) / indexPrice);
+  return markPrice.sub(indexPrice).div(indexPrice);
 }
 
 export function calculateFundingRate(
-  premiumIndex: number,
-  fundingRateCap: number,
-): number {
+  premiumIndex: Money,
+  fundingRateCap: Money,
+): Money {
   assertNonNegative(fundingRateCap, "funding rate cap");
 
-  return roundFinancial(clamp(premiumIndex, -fundingRateCap, fundingRateCap));
+  return clamp(premiumIndex, fundingRateCap.neg(), fundingRateCap);
 }
 
 export function shouldExecuteFunding(
@@ -52,7 +53,7 @@ export function shouldExecuteFunding(
   lastFundingTime: number | null,
   fundingIntervalHours: number,
 ): boolean {
-  assertPositive(fundingIntervalHours, "funding interval hours");
+  assertPositiveNumber(fundingIntervalHours, "funding interval hours");
 
   if (lastFundingTime == null) {
     return true;
@@ -66,7 +67,7 @@ export function nextFundingTime(
   lastFundingTime: number,
   fundingIntervalHours: number,
 ): number {
-  assertPositive(fundingIntervalHours, "funding interval hours");
+  assertPositiveNumber(fundingIntervalHours, "funding interval hours");
 
   return lastFundingTime + fundingIntervalHours * 60 * 60 * 1000;
 }
@@ -90,7 +91,7 @@ export function createFundingExecution(
   );
   const activePositions = input.positions.filter(
     (position) =>
-      position.marketId === input.market.marketId && position.quantity !== 0,
+      position.marketId === input.market.marketId && !position.quantity.isZero(),
   );
   const payments = activePositions.map((position) =>
     createFundingPayment({
@@ -158,14 +159,15 @@ export function applyFundingPayments(
 function createFundingPayment(input: {
   position: Position;
   eventId: string;
-  markPrice: number;
-  indexPrice: number;
-  fundingRate: number;
+  markPrice: Money;
+  indexPrice: Money;
+  fundingRate: Money;
   fundingTime: number;
 }): FundingPayment {
-  const paymentAmount = roundFinancial(
-    -input.position.quantity * input.markPrice * input.fundingRate,
-  );
+  const paymentAmount = input.position.quantity
+    .neg()
+    .mul(input.markPrice)
+    .mul(input.fundingRate);
 
   return {
     id: `${input.eventId}:${input.position.userId}:${input.position.marketId}`,
@@ -181,22 +183,25 @@ function createFundingPayment(input: {
   };
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(Math.max(value, min), max);
+function clamp(value: Money, min: Money, max: Money): Money {
+  return Decimal.min(Decimal.max(value, min), max);
 }
 
-function assertPositive(value: number, label: string): void {
+/** Funding intervals are a count of hours, not money. */
+function assertPositiveNumber(value: number, label: string): void {
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`${label} must be positive`);
   }
 }
 
-function assertNonNegative(value: number, label: string): void {
-  if (!Number.isFinite(value) || value < 0) {
-    throw new Error(`${label} must be non-negative`);
+function assertPositive(value: Money, label: string): void {
+  if (!value.isFinite() || value.lte(ZERO)) {
+    throw new Error(`${label} must be positive`);
   }
 }
 
-function roundFinancial(value: number): number {
-  return Number(value.toFixed(12));
+function assertNonNegative(value: Money, label: string): void {
+  if (!value.isFinite() || value.lt(ZERO)) {
+    throw new Error(`${label} must be non-negative`);
+  }
 }

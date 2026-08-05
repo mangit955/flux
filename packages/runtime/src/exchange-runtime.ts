@@ -1,8 +1,8 @@
 import { MatchingEngine, type NewOrderCommand } from "../../matching-engine/index";
-import { checkOrderMargin } from "../../risk/src/index";
+import { checkOrderMargin, money } from "../../risk/src/index";
 import { commandStream, InMemoryStreamBus, type StreamBus } from "./stream";
 import { RuntimeStore } from "./store";
-import type { RuntimeCommand, RuntimeOrder } from "./types";
+import { toRiskConfig, type RuntimeCommand, type RuntimeOrder } from "./types";
 import { MatchingWorker, RuntimePersistenceWorker } from "./workers";
 import { estimateMarketOrderRiskPrice, type MarketOrderRiskPrice } from "./market-order-risk";
 
@@ -85,8 +85,8 @@ export class ExchangeRuntime {
       throw new Error("withdraw amount must be positive");
     }
 
-    const balance = this.store.getBalance(userId, asset);
-    if (balance.total - balance.locked < amount) {
+    const balance = this.store.storedBalance(userId, asset);
+    if (balance.total.sub(balance.locked).lt(money(amount))) {
       throw new Error("insufficient available balance");
     }
 
@@ -132,7 +132,7 @@ export class ExchangeRuntime {
       {
         userId: input.userId,
         collateralAsset: market.quoteAsset,
-        walletBalance: this.store.getBalance(input.userId, market.quoteAsset).total,
+        walletBalance: this.store.storedBalance(input.userId, market.quoteAsset).total,
         positions: [...this.store.positions.values()].filter(
           (position) => position.userId === input.userId,
         ),
@@ -141,14 +141,14 @@ export class ExchangeRuntime {
       {
         marketId: input.marketId,
         side: input.side,
-        price: riskPrice,
-        quantity: input.quantity,
+        price: money(riskPrice),
+        quantity: money(input.quantity),
         reduceOnly: input.reduceOnly ?? false,
-        estimatedFeeRate: market.takerFeeRate,
+        estimatedFeeRate: money(market.takerFeeRate),
         leverage: input.leverage ?? DEFAULT_LEVERAGE,
       },
-      [market],
-      [{ marketId: input.marketId, price: riskPrice }],
+      [toRiskConfig(market)],
+      [{ marketId: input.marketId, price: money(riskPrice) }],
     );
 
     if (!check.ok) {

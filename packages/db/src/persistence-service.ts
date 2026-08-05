@@ -1,10 +1,15 @@
 import type { EngineEvent, TradeExecuted } from "../../matching-engine/index";
 import {
+  ZERO,
   applyFillToPosition,
   emptyPosition,
+  money,
+  moneyOr,
   positionSide,
+  toDecimalString,
   type FillInput,
   type MarketRiskConfig,
+  type Money,
   type Position,
 } from "../../risk/src/index";
 import type {
@@ -117,7 +122,7 @@ export class PersistenceService {
         await tx.updateOrderStatus({
           orderId: event.orderId,
           status: "CANCELLED",
-          remainingQuantity: decimalString(event.remainingQtyLots),
+          remainingQuantity: toDecimalString(money(event.remainingQtyLots)),
           updatedAt: new Date(event.timestamp),
         });
         return ["orders.mark_cancelled", "balance.unlock"];
@@ -136,7 +141,7 @@ export class PersistenceService {
         await tx.updateOrderStatus({
           orderId: event.orderId,
           status: "EXPIRED",
-          remainingQuantity: decimalString(event.remainingQtyLots),
+          remainingQuantity: toDecimalString(money(event.remainingQtyLots)),
           updatedAt: new Date(event.timestamp),
         });
         return ["orders.mark_expired", "balance.unlock"];
@@ -165,7 +170,7 @@ export class PersistenceService {
         await tx.updateOrderStatus({
           orderId: event.makerOrderId,
           status: makerStatus,
-          remainingQuantity: decimalString(event.makerOrderRemainingQtyLots),
+          remainingQuantity: toDecimalString(money(event.makerOrderRemainingQtyLots)),
           updatedAt: new Date(event.timestamp),
         });
 
@@ -177,7 +182,7 @@ export class PersistenceService {
         await tx.updateOrderStatus({
           orderId: event.takerOrderId,
           status: takerStatus,
-          remainingQuantity: decimalString(event.takerOrderRemainingQtyLots),
+          remainingQuantity: toDecimalString(money(event.takerOrderRemainingQtyLots)),
           updatedAt: new Date(event.timestamp),
         });
 
@@ -224,9 +229,9 @@ async function releaseOrderMargin(
     return;
   }
 
-  const lockedMargin = Number(order.lockedMargin ?? 0);
+  const lockedMargin = moneyOr(order.lockedMargin);
 
-  if (!(lockedMargin > 0)) {
+  if (!lockedMargin.gt(ZERO)) {
     return;
   }
 
@@ -243,8 +248,8 @@ async function releaseOrderMargin(
 /** What one side of a trade owes or is owed, once its position has been updated. */
 interface RoleFillOutcome {
   userId: string;
-  fee: number;
-  realizedPnlDelta: number;
+  fee: Money;
+  realizedPnlDelta: Money;
 }
 
 async function applyRoleFillToPosition(
@@ -259,17 +264,20 @@ async function applyRoleFillToPosition(
   const existing = positionFromWrite(
     await tx.findPosition(userId, event.market),
   ) ?? emptyPosition(userId, event.market, order?.leverage ?? DEFAULT_LEVERAGE);
+  // The matching engine still works in floats, so its values are parsed into exact decimals
+  // here, at the boundary. Everything downstream of this point is exact.
+  const price = money(event.priceTicks);
+  const quantity = money(event.qtyLots);
   // Charged by liquidity role, not always at the taker rate — providing liquidity is cheaper.
-  const fee =
-    event.priceTicks *
-    event.qtyLots *
-    (role === "MAKER" ? market.makerFeeRate : market.takerFeeRate);
+  const fee = price
+    .mul(quantity)
+    .mul(role === "MAKER" ? market.makerFeeRate : market.takerFeeRate);
   const fill: FillInput = {
     userId,
     marketId: event.market,
     side: side === "buy" ? "BUY" : "SELL",
-    price: event.priceTicks,
-    quantity: event.qtyLots,
+    price,
+    quantity,
     fee,
   };
   // `applyFillToPosition` subtracts the fee into `position.realizedPnl`, so the position row
@@ -296,7 +304,7 @@ async function settleRoleFill(
   const fillId = `${event.tradeId}:${role.toLowerCase()}`;
   const createdAt = new Date(event.timestamp);
 
-  if (outcome.realizedPnlDelta !== 0) {
+  if (!outcome.realizedPnlDelta.isZero()) {
     const balanceAfter = await tx.adjustBalanceTotal(
       outcome.userId,
       asset,
@@ -308,23 +316,27 @@ async function settleRoleFill(
       userId: outcome.userId,
       asset,
       type: "REALIZED_PNL",
-      amount: decimalString(outcome.realizedPnlDelta),
-      balanceAfter: decimalString(balanceAfter),
+      amount: toDecimalString(outcome.realizedPnlDelta),
+      balanceAfter: toDecimalString(balanceAfter),
       referenceId: fillId,
       createdAt,
     });
   }
 
-  if (outcome.fee > 0) {
-    const balanceAfter = await tx.adjustBalanceTotal(outcome.userId, asset, -outcome.fee);
+  if (outcome.fee.gt(ZERO)) {
+    const balanceAfter = await tx.adjustBalanceTotal(
+      outcome.userId,
+      asset,
+      outcome.fee.neg(),
+    );
 
     await tx.createLedgerEntry({
       id: `${fillId}:fee`,
       userId: outcome.userId,
       asset,
       type: "TRADING_FEE",
-      amount: decimalString(-outcome.fee),
-      balanceAfter: decimalString(balanceAfter),
+      amount: toDecimalString(outcome.fee.neg()),
+      balanceAfter: toDecimalString(balanceAfter),
       referenceId: fillId,
       createdAt,
     });
@@ -357,9 +369,11 @@ function orderWriteFromRestedEvent(
     type: orderTypeToDurable(event.order.type),
     timeInForce: timeInForceToDurable(event.order.timeInForce),
     price:
-      event.order.priceTicks == null ? null : decimalString(event.order.priceTicks),
-    quantity: decimalString(event.order.qtyLots),
-    remainingQuantity: decimalString(event.order.remainingQtyLots),
+      event.order.priceTicks == null
+        ? null
+        : toDecimalString(money(event.order.priceTicks)),
+    quantity: toDecimalString(money(event.order.qtyLots)),
+    remainingQuantity: toDecimalString(money(event.order.remainingQtyLots)),
     reduceOnly: event.order.reduceOnly,
     postOnly: event.order.postOnly,
     status: event.order.status,
@@ -375,9 +389,9 @@ function fillsFromTrade(
   taker: RoleFillOutcome,
 ): FillWrite[] {
   const createdAt = new Date(event.timestamp);
-  const price = decimalString(event.priceTicks);
-  const quantity = decimalString(event.qtyLots);
-  const notional = decimalString(event.priceTicks * event.qtyLots);
+  const price = money(event.priceTicks);
+  const quantity = money(event.qtyLots);
+  const notional = toDecimalString(price.mul(quantity));
 
   return [
     {
@@ -388,11 +402,11 @@ function fillsFromTrade(
       marketId: event.market,
       side: sideToDurable(event.makerSide),
       liquidityRole: "MAKER",
-      price,
-      quantity,
+      price: toDecimalString(price),
+      quantity: toDecimalString(quantity),
       notional,
-      fee: decimalString(maker.fee),
-      realizedPnl: decimalString(maker.realizedPnlDelta),
+      fee: toDecimalString(maker.fee),
+      realizedPnl: toDecimalString(maker.realizedPnlDelta),
       eventId: event.eventId,
       createdAt,
     },
@@ -404,11 +418,11 @@ function fillsFromTrade(
       marketId: event.market,
       side: sideToDurable(event.takerSide),
       liquidityRole: "TAKER",
-      price,
-      quantity,
+      price: toDecimalString(price),
+      quantity: toDecimalString(quantity),
       notional,
-      fee: decimalString(taker.fee),
-      realizedPnl: decimalString(taker.realizedPnlDelta),
+      fee: toDecimalString(taker.fee),
+      realizedPnl: toDecimalString(taker.realizedPnlDelta),
       eventId: event.eventId,
       createdAt,
     },
@@ -431,20 +445,16 @@ function orderStatusFromRemaining(remainingQtyLots: number): DurableOrderStatus 
   return remainingQtyLots === 0 ? "FILLED" : "PARTIALLY_FILLED";
 }
 
-function decimalString(value: number): string {
-  return String(value);
-}
-
 function marketToRiskConfig(market: MarketWrite): MarketRiskConfig {
   return {
     marketId: market.marketId,
-    tickSize: Number(market.tickSize),
-    lotSize: Number(market.lotSize),
+    tickSize: money(market.tickSize),
+    lotSize: money(market.lotSize),
     maxLeverage: market.maxLeverage,
-    initialMarginRate: Number(market.initialMarginRate),
-    maintenanceMarginRate: Number(market.maintenanceMarginRate),
-    makerFeeRate: Number(market.makerFeeRate),
-    takerFeeRate: Number(market.takerFeeRate),
+    initialMarginRate: money(market.initialMarginRate),
+    maintenanceMarginRate: money(market.maintenanceMarginRate),
+    makerFeeRate: money(market.makerFeeRate),
+    takerFeeRate: money(market.takerFeeRate),
   };
 }
 
@@ -453,9 +463,9 @@ function positionFromWrite(position: PositionWrite | null): Position | null {
     ? {
         userId: position.userId,
         marketId: position.marketId,
-        quantity: Number(position.quantity),
-        entryPrice: Number(position.entryPrice),
-        realizedPnl: Number(position.realizedPnl),
+        quantity: money(position.quantity),
+        entryPrice: money(position.entryPrice),
+        realizedPnl: money(position.realizedPnl),
         leverage: position.leverage,
       }
     : null;
@@ -466,9 +476,9 @@ function positionToWrite(position: Position, updatedAt: Date): PositionWrite {
     userId: position.userId,
     marketId: position.marketId,
     side: positionSide(position),
-    quantity: decimalString(position.quantity),
-    entryPrice: decimalString(position.entryPrice),
-    realizedPnl: decimalString(position.realizedPnl),
+    quantity: toDecimalString(position.quantity),
+    entryPrice: toDecimalString(position.entryPrice),
+    realizedPnl: toDecimalString(position.realizedPnl),
     leverage: position.leverage,
     updatedAt,
   };

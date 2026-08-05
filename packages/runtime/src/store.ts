@@ -3,15 +3,35 @@ import type {
   RuntimeFill,
   RuntimeMarket,
   RuntimeOrder,
+  RuntimePosition,
   RuntimeStateSnapshot,
   RuntimeUser,
 } from "./types";
-import type { Position } from "../../risk/src/index";
+import {
+  ZERO,
+  money,
+  toNumber,
+  type Money,
+  type Position,
+} from "../../risk/src/index";
+
+/**
+ * The in-memory balance state.
+ *
+ * Separate from `RuntimeBalance` on purpose: this is money and is held exactly, while
+ * `RuntimeBalance` is the DTO the API serializes and must stay plain numbers.
+ */
+interface StoredBalance {
+  userId: string;
+  asset: string;
+  total: Money;
+  locked: Money;
+}
 
 export class RuntimeStore {
   readonly users = new Map<string, RuntimeUser>();
   readonly sessions = new Map<string, string>();
-  readonly balances = new Map<string, RuntimeBalance>();
+  private readonly storedBalances = new Map<string, StoredBalance>();
   readonly markets = new Map<string, RuntimeMarket>();
   readonly orders = new Map<string, RuntimeOrder>();
   readonly fills = new Map<string, RuntimeFill>();
@@ -65,19 +85,18 @@ export class RuntimeStore {
 
   adjustBalance(userId: string, asset: string, amount: number): RuntimeBalance {
     const key = balanceKey(userId, asset);
-    const current =
-      this.balances.get(key) ?? { userId, asset, total: 0, locked: 0 };
-    const next = {
+    const current = this.storedBalance(userId, asset);
+    const next: StoredBalance = {
       ...current,
-      total: Number((current.total + amount).toFixed(12)),
+      total: current.total.add(money(amount)),
     };
 
-    if (next.total < 0) {
+    if (next.total.isNegative()) {
       throw new Error("insufficient balance");
     }
 
-    this.balances.set(key, next);
-    return next;
+    this.storedBalances.set(key, next);
+    return toRuntimeBalance(next);
   }
 
   /**
@@ -87,32 +106,58 @@ export class RuntimeStore {
    * bad debt, and refusing to record them would silently forgive the shortfall. `adjustBalance`
    * keeps its guard for deposits and withdrawals, where a negative result means a bug.
    */
-  settleBalance(userId: string, asset: string, amount: number): RuntimeBalance {
+  settleBalance(userId: string, asset: string, amount: Money): RuntimeBalance {
     const key = balanceKey(userId, asset);
-    const current =
-      this.balances.get(key) ?? { userId, asset, total: 0, locked: 0 };
-    const next = {
+    const current = this.storedBalance(userId, asset);
+    const next: StoredBalance = {
       ...current,
-      total: Number((current.total + amount).toFixed(12)),
+      total: current.total.add(amount),
     };
 
-    if (next.total < 0) {
+    if (next.total.isNegative()) {
       console.error(
-        `balance went negative for user ${userId} ${asset}: ${next.total} after ${amount}`,
+        `balance went negative for user ${userId} ${asset}: ${next.total.toFixed()} after ${amount.toFixed()}`,
       );
     }
 
-    this.balances.set(key, next);
-    return next;
+    this.storedBalances.set(key, next);
+    return toRuntimeBalance(next);
   }
 
   getBalance(userId: string, asset: string): RuntimeBalance {
-    return this.balances.get(balanceKey(userId, asset)) ?? {
-      userId,
-      asset,
-      total: 0,
-      locked: 0,
-    };
+    return toRuntimeBalance(this.storedBalance(userId, asset));
+  }
+
+  /** Every balance a user holds, as the API DTO. */
+  balancesFor(userId: string): RuntimeBalance[] {
+    return [...this.storedBalances.values()]
+      .filter((balance) => balance.userId === userId)
+      .map(toRuntimeBalance);
+  }
+
+  /** Exact balance, for the margin path. Never crosses the API edge. */
+  storedBalance(userId: string, asset: string): StoredBalance {
+    return (
+      this.storedBalances.get(balanceKey(userId, asset)) ?? {
+        userId,
+        asset,
+        total: ZERO,
+        locked: ZERO,
+      }
+    );
+  }
+
+  setLocked(userId: string, asset: string, locked: Money): void {
+    const current = this.storedBalance(userId, asset);
+
+    this.storedBalances.set(balanceKey(userId, asset), { ...current, locked });
+  }
+
+  /** Every position a user holds, as the API DTO. */
+  positionsFor(userId: string): RuntimePosition[] {
+    return [...this.positions.values()]
+      .filter((position) => position.userId === userId)
+      .map(toRuntimePosition);
   }
 
   getPosition(userId: string, marketId: string): Position | undefined {
@@ -126,7 +171,7 @@ export class RuntimeStore {
   snapshot(): RuntimeStateSnapshot {
     return {
       users: [...this.users.values()],
-      balances: [...this.balances.values()],
+      balances: [...this.storedBalances.values()].map(toRuntimeBalance),
       markets: [...this.markets.values()],
       orders: [...this.orders.values()],
       fills: [...this.fills.values()],
@@ -158,6 +203,32 @@ export class RuntimeStore {
       this.markets.set(market.marketId, market);
     }
   }
+}
+
+/**
+ * Drop a position to plain numbers for the API and websocket.
+ *
+ * Without this a `Decimal` reaches `JSON.stringify`, which renders it as a *string* via
+ * `toJSON()` — silently changing `1.5` to `"1.5"` on the wire.
+ */
+function toRuntimePosition(position: Position): RuntimePosition {
+  return {
+    userId: position.userId,
+    marketId: position.marketId,
+    quantity: toNumber(position.quantity),
+    entryPrice: toNumber(position.entryPrice),
+    realizedPnl: toNumber(position.realizedPnl),
+    leverage: position.leverage,
+  };
+}
+
+function toRuntimeBalance(balance: StoredBalance): RuntimeBalance {
+  return {
+    userId: balance.userId,
+    asset: balance.asset,
+    total: toNumber(balance.total),
+    locked: toNumber(balance.locked),
+  };
 }
 
 export function balanceKey(userId: string, asset: string): string {

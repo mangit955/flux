@@ -1,3 +1,4 @@
+import { ZERO, type Money } from "./decimal";
 import { calculateUnrealizedPnl, positionNotional } from "./position-engine";
 import type {
   AccountState,
@@ -6,7 +7,6 @@ import type {
   MarketRiskConfig,
   OpenOrderRisk,
   OrderMarginCheck,
-  Position,
 } from "./types";
 
 export function calculateMarginSummary(
@@ -17,12 +17,12 @@ export function calculateMarginSummary(
   const marketById = indexMarkets(markets);
   const markPriceByMarket = indexMarkPrices(markPrices);
 
-  let unrealizedPnl = 0;
-  let initialMargin = 0;
-  let maintenanceMargin = 0;
+  let unrealizedPnl = ZERO;
+  let initialMargin = ZERO;
+  let maintenanceMargin = ZERO;
 
   for (const position of account.positions) {
-    if (position.quantity === 0) {
+    if (position.quantity.isZero()) {
       continue;
     }
 
@@ -30,38 +30,41 @@ export function calculateMarginSummary(
     const markPrice = requireMarkPrice(markPriceByMarket, position.marketId);
     const notional = positionNotional(position, markPrice);
 
-    unrealizedPnl += calculateUnrealizedPnl(position, markPrice);
-    initialMargin += notional / position.leverage;
-    maintenanceMargin += notional * market.maintenanceMarginRate;
+    unrealizedPnl = unrealizedPnl.add(calculateUnrealizedPnl(position, markPrice));
+    initialMargin = initialMargin.add(notional.div(position.leverage));
+    maintenanceMargin = maintenanceMargin.add(
+      notional.mul(market.maintenanceMarginRate),
+    );
   }
 
   const openOrderInitialMargin = account.openOrders.reduce(
-    (sum, order) => sum + initialMarginForOpenOrder(order, marketById),
-    0,
+    (sum, order) => sum.add(initialMarginForOpenOrder(order, marketById)),
+    ZERO,
   );
   const openOrderFees = account.openOrders.reduce(
-    (sum, order) => sum + estimatedFeeForOpenOrder(order),
-    0,
+    (sum, order) => sum.add(estimatedFeeForOpenOrder(order)),
+    ZERO,
   );
-  const accountEquity = account.walletBalance + unrealizedPnl;
-  const availableMargin =
-    accountEquity - initialMargin - openOrderInitialMargin - openOrderFees;
+  const accountEquity = account.walletBalance.add(unrealizedPnl);
+  const availableMargin = accountEquity
+    .sub(initialMargin)
+    .sub(openOrderInitialMargin)
+    .sub(openOrderFees);
 
   return {
     userId: account.userId,
     collateralAsset: account.collateralAsset,
-    walletBalance: roundFinancial(account.walletBalance),
-    unrealizedPnl: roundFinancial(unrealizedPnl),
-    accountEquity: roundFinancial(accountEquity),
-    initialMargin: roundFinancial(initialMargin),
-    maintenanceMargin: roundFinancial(maintenanceMargin),
-    openOrderInitialMargin: roundFinancial(openOrderInitialMargin),
-    openOrderFees: roundFinancial(openOrderFees),
-    availableMargin: roundFinancial(availableMargin),
-    marginRatio:
-      maintenanceMargin === 0
-        ? null
-        : roundFinancial(accountEquity / maintenanceMargin),
+    walletBalance: account.walletBalance,
+    unrealizedPnl,
+    accountEquity,
+    initialMargin,
+    maintenanceMargin,
+    openOrderInitialMargin,
+    openOrderFees,
+    availableMargin,
+    marginRatio: maintenanceMargin.isZero()
+      ? null
+      : accountEquity.div(maintenanceMargin),
   };
 }
 
@@ -76,9 +79,9 @@ export function checkOrderMargin(
   if (!market) {
     return {
       ok: false,
-      requiredInitialMargin: 0,
-      requiredFee: 0,
-      availableMargin: 0,
+      requiredInitialMargin: ZERO,
+      requiredFee: ZERO,
+      availableMargin: ZERO,
       reason: "UNKNOWN_MARKET",
     };
   }
@@ -90,8 +93,8 @@ export function checkOrderMargin(
   ) {
     return {
       ok: false,
-      requiredInitialMargin: 0,
-      requiredFee: 0,
+      requiredInitialMargin: ZERO,
+      requiredFee: ZERO,
       availableMargin: calculateMarginSummary(account, markets, markPrices)
         .availableMargin,
       reason: "INVALID_LEVERAGE",
@@ -101,13 +104,13 @@ export function checkOrderMargin(
   const summary = calculateMarginSummary(account, markets, markPrices);
   const requiredInitialMargin = initialMarginForOpenOrder(order, new Map([[market.marketId, market]]));
   const requiredFee = estimatedFeeForOpenOrder(order);
-  const required = requiredInitialMargin + requiredFee;
-  const ok = order.reduceOnly || summary.availableMargin >= required;
+  const required = requiredInitialMargin.add(requiredFee);
+  const ok = order.reduceOnly || summary.availableMargin.gte(required);
 
   return {
     ok,
-    requiredInitialMargin: roundFinancial(requiredInitialMargin),
-    requiredFee: roundFinancial(requiredFee),
+    requiredInitialMargin,
+    requiredFee,
     availableMargin: summary.availableMargin,
     reason: ok ? undefined : "INSUFFICIENT_MARGIN",
   };
@@ -121,31 +124,31 @@ export function isMaintenanceMarginViolated(
   const summary = calculateMarginSummary(account, markets, markPrices);
 
   return (
-    summary.maintenanceMargin > 0 &&
-    summary.accountEquity <= summary.maintenanceMargin
+    summary.maintenanceMargin.gt(ZERO) &&
+    summary.accountEquity.lte(summary.maintenanceMargin)
   );
 }
 
 function initialMarginForOpenOrder(
   order: OpenOrderRisk,
   marketById: Map<string, MarketRiskConfig>,
-): number {
+): Money {
   if (order.reduceOnly) {
-    return 0;
+    return ZERO;
   }
 
   const market = requireMarket(marketById, order.marketId);
   const leverage = Math.min(order.leverage, market.maxLeverage);
 
-  return (order.price * order.quantity) / leverage;
+  return order.price.mul(order.quantity).div(leverage);
 }
 
-function estimatedFeeForOpenOrder(order: OpenOrderRisk): number {
+function estimatedFeeForOpenOrder(order: OpenOrderRisk): Money {
   if (order.reduceOnly) {
-    return 0;
+    return ZERO;
   }
 
-  return order.price * order.quantity * order.estimatedFeeRate;
+  return order.price.mul(order.quantity).mul(order.estimatedFeeRate);
 }
 
 function requireMarket(
@@ -162,9 +165,9 @@ function requireMarket(
 }
 
 function requireMarkPrice(
-  markPriceByMarket: Map<string, number>,
+  markPriceByMarket: Map<string, Money>,
   marketId: string,
-): number {
+): Money {
   const price = markPriceByMarket.get(marketId);
 
   if (price == null) {
@@ -178,10 +181,6 @@ function indexMarkets(markets: MarketRiskConfig[]): Map<string, MarketRiskConfig
   return new Map(markets.map((market) => [market.marketId, market]));
 }
 
-function indexMarkPrices(markPrices: MarkPrice[]): Map<string, number> {
+function indexMarkPrices(markPrices: MarkPrice[]): Map<string, Money> {
   return new Map(markPrices.map((markPrice) => [markPrice.marketId, markPrice.price]));
-}
-
-function roundFinancial(value: number): number {
-  return Number(value.toFixed(12));
 }

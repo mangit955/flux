@@ -4,6 +4,7 @@ import type {
   RuntimeFill,
   RuntimeMarket,
   RuntimeOrder,
+  RuntimePosition,
   RuntimeUser,
 } from "./types";
 
@@ -19,7 +20,7 @@ export interface ApiRuntime {
   submitOrder(input: SubmitOrderInput): Promise<RuntimeOrder>;
   cancelOrder(userId: string, marketId: string, orderId: string): Promise<void>;
   listBalances(userId: string): Promise<RuntimeBalance[]>;
-  listPositions(userId: string): Promise<unknown[]>;
+  listPositions(userId: string): Promise<RuntimePosition[]>;
   listOrders(userId: string): Promise<RuntimeOrder[]>;
   getOrder(userId: string, orderId: string): Promise<RuntimeOrder | null>;
   listFills(userId: string): Promise<RuntimeFill[]>;
@@ -94,15 +95,11 @@ export class InMemoryApiRuntime implements ApiRuntime {
   }
 
   async listBalances(userId: string): Promise<RuntimeBalance[]> {
-    return [...this.runtime.store.balances.values()].filter(
-      (balance) => balance.userId === userId,
-    );
+    return this.runtime.store.balancesFor(userId);
   }
 
-  async listPositions(userId: string): Promise<unknown[]> {
-    return [...this.runtime.store.positions.values()].filter(
-      (position) => position.userId === userId,
-    );
+  async listPositions(userId: string): Promise<RuntimePosition[]> {
+    return this.runtime.store.positionsFor(userId);
   }
 
   async listOrders(userId: string): Promise<RuntimeOrder[]> {

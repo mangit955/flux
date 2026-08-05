@@ -44,7 +44,7 @@ Load tests: `k6 run load-tests/perpetual-futures-load-test.js` (API must be runn
 ## Verification rules — non-negotiable
 
 `.github/workflows/ci.yml` runs `bun test`, `bun run check-types`, and `docker compose config`
-on push to `main` and every PR. Green baseline: **75 tests pass, 10/10 workspaces type-check.**
+on push to `main` and every PR. Green baseline: **108 tests pass, 10/10 workspaces type-check.**
 The `verify` skill wraps the full gate.
 
 1. **Run the gate before saying a change is done**, and run it *after* the last edit — not

@@ -1,3 +1,10 @@
+import {
+  ZERO,
+  money,
+  moneyOr,
+  toDecimalString,
+  type Money,
+} from "../../risk/src/index";
 import type {
   FillWrite,
   LedgerEntryWrite,
@@ -123,13 +130,13 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
     return {
       marketId: market.id,
       quoteAsset: market.quoteAsset,
-      tickSize: String(market.tickSize),
-      lotSize: String(market.lotSize),
+      tickSize: decimalColumn(market.tickSize),
+      lotSize: decimalColumn(market.lotSize),
       maxLeverage: market.maxLeverage,
-      initialMarginRate: String(market.initialMarginRate),
-      maintenanceMarginRate: String(market.maintenanceMarginRate),
-      makerFeeRate: String(market.makerFeeRate),
-      takerFeeRate: String(market.takerFeeRate),
+      initialMarginRate: decimalColumn(market.initialMarginRate),
+      maintenanceMarginRate: decimalColumn(market.maintenanceMarginRate),
+      makerFeeRate: decimalColumn(market.makerFeeRate),
+      takerFeeRate: decimalColumn(market.takerFeeRate),
     };
   }
 
@@ -160,9 +167,9 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
       userId: position.userId,
       marketId: position.marketId,
       side: position.side,
-      quantity: String(position.quantity),
-      entryPrice: String(position.entryPrice),
-      realizedPnl: String(position.realizedPnl),
+      quantity: decimalColumn(position.quantity),
+      entryPrice: decimalColumn(position.entryPrice),
+      realizedPnl: decimalColumn(position.realizedPnl),
       leverage: position.leverage,
       updatedAt: position.updatedAt,
     };
@@ -245,8 +252,8 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
     return row as OrderWrite;
   }
 
-  async unlockBalanceForOrder(userId: string, asset: string, amount: number): Promise<void> {
-    if (amount <= 0) {
+  async unlockBalanceForOrder(userId: string, asset: string, amount: Money): Promise<void> {
+    if (amount.lte(ZERO)) {
       return;
     }
 
@@ -264,7 +271,7 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
          FROM prev
         WHERE b."id" = prev."id"
        RETURNING prev."locked" AS "lockedBefore"`,
-      String(amount),
+      toDecimalString(amount),
       userId,
       asset,
     );
@@ -274,9 +281,9 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
       return;
     }
 
-    const lockedBefore = Number(rows[0]?.lockedBefore ?? 0);
+    const lockedBefore = moneyOr(rows[0]?.lockedBefore as string | null | undefined);
 
-    if (amount > lockedBefore) {
+    if (amount.gt(lockedBefore)) {
       // The release amount is the value recorded on the order, so a mismatch means the locked
       // column drifted from the orders that own it. Clamping hides that; log it loudly.
       // Throwing would be better, but the persistence worker acks on failure (TODO #11), so a
@@ -292,8 +299,8 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
   async adjustBalanceTotal(
     userId: string,
     asset: string,
-    delta: number,
-  ): Promise<number> {
+    delta: Money,
+  ): Promise<Money> {
     // Upsert, because a user can be credited before ever holding a row for the asset. Raw SQL
     // cannot lean on Prisma's @default(cuid()), so the id is supplied here.
     const rows = await this.tx.$queryRawUnsafe<{ total: unknown }>(
@@ -305,12 +312,12 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
       crypto.randomUUID(),
       userId,
       asset,
-      String(delta),
+      toDecimalString(delta),
     );
 
-    const total = Number(rows[0]?.total ?? 0);
+    const total = moneyOr(rows[0]?.total as string | null | undefined);
 
-    if (total < 0) {
+    if (total.isNegative()) {
       // Bad debt: losses exceeded collateral. Recorded rather than refused — clamping would
       // silently forgive the shortfall, and throwing would drop the fill entirely (TODO #11).
       // The liquidation engine and insurance fund (TODO #12) are what resolve this.
@@ -335,4 +342,15 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
       },
     });
   }
+}
+
+/**
+ * Normalize a Prisma `Decimal` column into the fixed-scale text the write records carry.
+ *
+ * Prisma's Decimal falls back to exponential notation for small magnitudes, so `String(decimal)`
+ * would put a second representation of the same number into the write records. Postgres accepts
+ * both; normalizing here means every value in a `*Write` record has one canonical form.
+ */
+function decimalColumn(value: unknown): string {
+  return toDecimalString(money(String(value)));
 }

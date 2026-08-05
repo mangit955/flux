@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { money } from "./decimal";
 import {
   calculateAdlScore,
   createAdlActions,
@@ -15,17 +16,19 @@ import type {
   Position,
 } from "./types";
 
+const m = money;
+
 const CREATED_AT = 1_700_000_000_000;
 
 const market: MarketRiskConfig = {
   marketId: "BTC-PERP",
-  tickSize: 0.1,
-  lotSize: 0.001,
+  tickSize: m("0.1"),
+  lotSize: m("0.001"),
   maxLeverage: 20,
-  initialMarginRate: 0.05,
-  maintenanceMarginRate: 0.005,
-  makerFeeRate: 0.0002,
-  takerFeeRate: 0.0005,
+  initialMarginRate: m("0.05"),
+  maintenanceMarginRate: m("0.005"),
+  makerFeeRate: m("0.0002"),
+  takerFeeRate: m("0.0005"),
 };
 
 describe("liquidation triggers", () => {
@@ -34,39 +37,31 @@ describe("liquidation triggers", () => {
       eventId: "liq-1",
       account: account({
         walletBalance: 5,
-        positions: [
-          position({
-            quantity: 1,
-            entryPrice: 100,
-            leverage: 10,
-          }),
-        ],
+        positions: [position({ quantity: 1, entryPrice: 100, leverage: 10 })],
       }),
       markets: [market],
-      markPrices: [{ marketId: market.marketId, price: 94 }],
+      markPrices: [{ marketId: market.marketId, price: m(94) }],
       createdAt: CREATED_AT,
-      slippageBufferRate: 0.01,
+      slippageBufferRate: m("0.01"),
     });
 
     expect(triggers).toHaveLength(1);
-    expect(triggers[0]).toMatchObject({
-      eventId: "liq-1:BTC-PERP",
-      userId: "user-1",
-      marketId: "BTC-PERP",
-      positionQuantity: 1,
-      markPrice: 94,
-      maintenanceMargin: 0.47,
-      accountEquity: -1,
-      status: "TRIGGERED",
-      createdAt: CREATED_AT,
-      order: {
-        orderId: "liq-1:BTC-PERP:liquidation-order",
-        side: "SELL",
-        quantity: 1,
-        limitPrice: 93.06,
-        reduceOnly: true,
-      },
-    });
+
+    const trigger = triggers[0];
+    expect(trigger?.eventId).toBe("liq-1:BTC-PERP");
+    expect(trigger?.userId).toBe("user-1");
+    expect(trigger?.marketId).toBe("BTC-PERP");
+    expect(trigger?.positionQuantity.toFixed()).toBe("1");
+    expect(trigger?.markPrice.toFixed()).toBe("94");
+    expect(trigger?.maintenanceMargin.toFixed()).toBe("0.47");
+    expect(trigger?.accountEquity.toFixed()).toBe("-1");
+    expect(trigger?.status).toBe("TRIGGERED");
+    expect(trigger?.createdAt).toBe(CREATED_AT);
+    expect(trigger?.order.orderId).toBe("liq-1:BTC-PERP:liquidation-order");
+    expect(trigger?.order.side).toBe("SELL");
+    expect(trigger?.order.quantity.toFixed()).toBe("1");
+    expect(trigger?.order.limitPrice.toFixed()).toBe("93.06");
+    expect(trigger?.order.reduceOnly).toBe(true);
   });
 
   it("does not trigger liquidation when equity is above maintenance margin", () => {
@@ -74,16 +69,10 @@ describe("liquidation triggers", () => {
       eventId: "liq-1",
       account: account({
         walletBalance: 100,
-        positions: [
-          position({
-            quantity: 1,
-            entryPrice: 100,
-            leverage: 10,
-          }),
-        ],
+        positions: [position({ quantity: 1, entryPrice: 100, leverage: 10 })],
       }),
       markets: [market],
-      markPrices: [{ marketId: market.marketId, price: 94 }],
+      markPrices: [{ marketId: market.marketId, price: m(94) }],
       createdAt: CREATED_AT,
     });
 
@@ -94,50 +83,43 @@ describe("liquidation triggers", () => {
     const order = createLiquidationOrder({
       eventId: "liq-1",
       userId: "user-1",
-      position: position({
-        quantity: -2,
-        entryPrice: 100,
-      }),
-      markPrice: 110,
-      slippageBufferRate: 0.01,
+      position: position({ quantity: -2, entryPrice: 100 }),
+      markPrice: m(110),
+      slippageBufferRate: m("0.01"),
     });
 
-    expect(order).toEqual({
-      orderId: "liq-1:BTC-PERP:liquidation-order",
-      userId: "user-1",
-      marketId: "BTC-PERP",
-      side: "BUY",
-      quantity: 2,
-      limitPrice: 111.1,
-      reduceOnly: true,
-    });
+    expect(order.orderId).toBe("liq-1:BTC-PERP:liquidation-order");
+    expect(order.userId).toBe("user-1");
+    expect(order.marketId).toBe("BTC-PERP");
+    expect(order.side).toBe("BUY");
+    expect(order.quantity.toFixed()).toBe("2");
+    expect(order.limitPrice.toFixed()).toBe("111.1");
+    expect(order.reduceOnly).toBe(true);
   });
 });
 
 describe("insurance fund and ADL", () => {
   it("covers a deficit fully with the insurance fund", () => {
-    const usage = useInsuranceFund(fund({ balance: 100 }), 40);
+    const usage = useInsuranceFund(fund({ balance: 100 }), m(40));
 
-    expect(usage).toEqual({
-      asset: "USDC",
-      requested: 40,
-      used: 40,
-      remainingDeficit: 0,
-      nextFundBalance: 60,
-    });
+    expect(usage.asset).toBe("USDC");
+    expect(usage.requested.toFixed()).toBe("40");
+    expect(usage.used.toFixed()).toBe("40");
+    expect(usage.remainingDeficit.toFixed()).toBe("0");
+    expect(usage.nextFundBalance.toFixed()).toBe("60");
   });
 
   it("uses ADL after the insurance fund is exhausted", () => {
     const settlement = settleLiquidationDeficit({
       asset: "USDC",
-      deficit: 150,
+      deficit: m(150),
       insuranceFund: fund({ balance: 50 }),
       liquidatedPosition: position({
         userId: "liquidated",
         quantity: 2,
         entryPrice: 100,
       }),
-      markPrice: 100,
+      markPrice: m(100),
       adlCandidates: [
         adlCandidate({
           userId: "lower-score",
@@ -156,36 +138,33 @@ describe("insurance fund and ADL", () => {
       ],
     });
 
-    expect(settlement.insuranceFund).toMatchObject({
-      used: 50,
-      remainingDeficit: 100,
-      nextFundBalance: 0,
-    });
+    expect(settlement.insuranceFund.used.toFixed()).toBe("50");
+    expect(settlement.insuranceFund.remainingDeficit.toFixed()).toBe("100");
+    expect(settlement.insuranceFund.nextFundBalance.toFixed()).toBe("0");
     expect(settlement.status).toBe("ADL_USED");
-    expect(settlement.unresolvedDeficit).toBe(0);
-    expect(settlement.adlActions).toEqual([
-      {
-        userId: "higher-score",
-        marketId: "BTC-PERP",
-        side: "BUY",
-        quantity: 1,
-        price: 100,
-        score: 0.666666666667,
-      },
-    ]);
+    expect(settlement.unresolvedDeficit.isZero()).toBe(true);
+
+    expect(settlement.adlActions).toHaveLength(1);
+    const action = settlement.adlActions[0];
+    expect(action?.userId).toBe("higher-score");
+    expect(action?.marketId).toBe("BTC-PERP");
+    expect(action?.side).toBe("BUY");
+    expect(action?.quantity.toFixed()).toBe("1");
+    expect(action?.price.toFixed()).toBe("100");
+    expect(action?.score.toFixed(12)).toBe("0.666666666667");
   });
 
   it("reports unresolved deficit when ADL liquidity is insufficient", () => {
     const settlement = settleLiquidationDeficit({
       asset: "USDC",
-      deficit: 300,
+      deficit: m(300),
       insuranceFund: fund({ balance: 0 }),
       liquidatedPosition: position({
         userId: "liquidated",
         quantity: 5,
         entryPrice: 100,
       }),
-      markPrice: 100,
+      markPrice: m(100),
       adlCandidates: [
         adlCandidate({
           userId: "short-1",
@@ -199,7 +178,7 @@ describe("insurance fund and ADL", () => {
 
     expect(settlement.status).toBe("FAILED");
     expect(settlement.adlActions).toHaveLength(1);
-    expect(settlement.unresolvedDeficit).toBe(200);
+    expect(settlement.unresolvedDeficit.toFixed()).toBe("200");
   });
 
   it("ranks ADL candidates by profitability and effective leverage", () => {
@@ -218,45 +197,60 @@ describe("insurance fund and ADL", () => {
       markPrice: 100,
     });
 
-    expect(calculateAdlScore(high)).toBeGreaterThan(calculateAdlScore(low));
+    expect(calculateAdlScore(high).gt(calculateAdlScore(low))).toBe(true);
 
     const actions = createAdlActions({
       liquidatedPosition: position({ quantity: 2, entryPrice: 100 }),
-      markPrice: 100,
-      quantityToReduce: 1.5,
+      markPrice: m(100),
+      quantityToReduce: m("1.5"),
       candidates: [low, high],
     });
 
     expect(actions.map((action) => action.userId)).toEqual(["high", "low"]);
-    expect(actions.map((action) => action.quantity)).toEqual([1, 0.5]);
+    expect(actions.map((action) => action.quantity.toFixed())).toEqual([
+      "1",
+      "0.5",
+    ]);
   });
 });
 
-function account(overrides: Partial<AccountState>): AccountState {
+function account(overrides: {
+  userId?: string;
+  collateralAsset?: string;
+  walletBalance?: number;
+  positions?: Position[];
+}): AccountState {
   return {
     userId: overrides.userId ?? "user-1",
     collateralAsset: overrides.collateralAsset ?? "USDC",
-    walletBalance: overrides.walletBalance ?? 0,
+    walletBalance: m(overrides.walletBalance ?? 0),
     positions: overrides.positions ?? [],
-    openOrders: overrides.openOrders ?? [],
+    openOrders: [],
   };
 }
 
-function position(overrides: Partial<Position>): Position {
+function position(overrides: {
+  userId?: string;
+  marketId?: string;
+  quantity?: number;
+  entryPrice?: number;
+  realizedPnl?: number;
+  leverage?: number;
+}): Position {
   return {
     userId: overrides.userId ?? "user-1",
     marketId: overrides.marketId ?? market.marketId,
-    quantity: overrides.quantity ?? 0,
-    entryPrice: overrides.entryPrice ?? 100,
-    realizedPnl: overrides.realizedPnl ?? 0,
+    quantity: m(overrides.quantity ?? 0),
+    entryPrice: m(overrides.entryPrice ?? 100),
+    realizedPnl: m(overrides.realizedPnl ?? 0),
     leverage: overrides.leverage ?? 10,
   };
 }
 
-function fund(overrides: Partial<InsuranceFund>): InsuranceFund {
+function fund(overrides: { asset?: string; balance?: number }): InsuranceFund {
   return {
     asset: overrides.asset ?? "USDC",
-    balance: overrides.balance ?? 0,
+    balance: m(overrides.balance ?? 0),
   };
 }
 
@@ -274,7 +268,7 @@ function adlCandidate(input: {
       quantity: input.quantity,
       entryPrice: input.entryPrice,
     }),
-    accountEquity: input.accountEquity,
-    markPrice: input.markPrice,
+    accountEquity: m(input.accountEquity),
+    markPrice: m(input.markPrice),
   };
 }
