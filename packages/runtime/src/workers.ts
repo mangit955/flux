@@ -12,6 +12,9 @@ import { commandStream, eventStream, type StreamBus } from "./stream";
 import type { RuntimeCommand, RuntimeFill, RuntimeOrder } from "./types";
 import type { RuntimeStore } from "./store";
 
+/** Leverage assumed when the order that opened the position is no longer in the store. */
+const DEFAULT_LEVERAGE = 10;
+
 // WebSocket hub interface for event publishing
 interface WebSocketPublisher {
   publish(input: {
@@ -266,9 +269,14 @@ export class RuntimePersistenceWorker {
       throw new Error(`Unknown market ${event.market}`);
     }
 
+    const orderId = role === "MAKER" ? event.makerOrderId : event.takerOrderId;
     const existing =
       this.store.getPosition(userId, event.market) ??
-      emptyPosition(userId, event.market, 10);
+      emptyPosition(
+        userId,
+        event.market,
+        this.store.orders.get(orderId)?.leverage ?? DEFAULT_LEVERAGE,
+      );
     const fill: FillInput = {
       userId,
       marketId: event.market,

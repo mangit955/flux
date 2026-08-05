@@ -35,6 +35,9 @@ export interface OrderWrite {
   price: string | null;
   quantity: string;
   remainingQuantity: string;
+  /** Collateral reserved for this order at submit time; released verbatim when it terminates. */
+  lockedMargin?: string;
+  leverage?: number;
   reduceOnly: boolean;
   postOnly: boolean;
   status: DurableOrderStatus;
@@ -70,6 +73,7 @@ export interface FillWrite {
 
 export interface MarketWrite {
   marketId: string;
+  quoteAsset: string;
   tickSize: string;
   lotSize: string;
   maxLeverage: number;

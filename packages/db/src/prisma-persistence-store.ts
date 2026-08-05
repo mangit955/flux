@@ -103,6 +103,7 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
 
     const market = row as {
       id: string;
+      quoteAsset: string;
       tickSize: unknown;
       lotSize: unknown;
       maxLeverage: number;
@@ -114,6 +115,7 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
 
     return {
       marketId: market.id,
+      quoteAsset: market.quoteAsset,
       tickSize: String(market.tickSize),
       lotSize: String(market.lotSize),
       maxLeverage: market.maxLeverage,
@@ -256,6 +258,17 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
     }
 
     const currentLocked = Number((balance as { locked: unknown }).locked);
+
+    if (amount > currentLocked) {
+      // The release amount is now the value recorded on the order, so a mismatch means the
+      // locked column drifted from the orders that own it. Clamping hides that; log it loudly.
+      // Throwing would be better, but the persistence worker acks on failure (TODO #11), so a
+      // throw drops the event and strands the margin with no alarm at all.
+      console.error(
+        `margin release exceeds locked balance for user ${userId} ${asset}: releasing ${amount}, locked ${currentLocked}`,
+      );
+    }
+
     const newLocked = Math.max(0, currentLocked - amount);
 
     await this.tx.balance.update({
@@ -271,5 +284,15 @@ class PrismaPersistenceTransaction implements PersistenceTransaction {
     });
 
     console.log(`🔓 Unlocked ${amount.toFixed(2)} ${asset} for user ${userId} (remaining locked: ${newLocked.toFixed(2)})`);
+  }
+
+  async clearOrderLockedMargin(orderId: string, updatedAt: Date): Promise<void> {
+    await this.tx.order.updateMany({
+      where: { id: orderId },
+      data: {
+        lockedMargin: "0",
+        updatedAt,
+      },
+    });
   }
 }
