@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { ZERO, money } from "./decimal";
 import {
   applyFundingPayments,
   calculateFundingRate,
@@ -9,25 +10,33 @@ import {
 } from "./funding";
 import type { Balance, FundingMarketConfig, Position } from "./types";
 
+const m = money;
+
 const EIGHT_HOURS_MS = 8 * 60 * 60 * 1000;
 const FUNDING_TIME = 1_700_000_000_000;
 
 const market: FundingMarketConfig = {
   marketId: "BTC-PERP",
   fundingIntervalHours: 8,
-  fundingRateCap: 0.00375,
+  fundingRateCap: m("0.00375"),
 };
 
 describe("funding calculations", () => {
   it("calculates premium index from mark and index prices", () => {
-    expect(calculatePremiumIndex(101, 100)).toBe(0.01);
-    expect(calculatePremiumIndex(99, 100)).toBe(-0.01);
+    expect(calculatePremiumIndex(m(101), m(100)).toFixed()).toBe("0.01");
+    expect(calculatePremiumIndex(m(99), m(100)).toFixed()).toBe("-0.01");
   });
 
   it("caps funding rate in both directions", () => {
-    expect(calculateFundingRate(0.01, market.fundingRateCap)).toBe(0.00375);
-    expect(calculateFundingRate(-0.01, market.fundingRateCap)).toBe(-0.00375);
-    expect(calculateFundingRate(0.001, market.fundingRateCap)).toBe(0.001);
+    expect(calculateFundingRate(m("0.01"), market.fundingRateCap).toFixed()).toBe(
+      "0.00375",
+    );
+    expect(
+      calculateFundingRate(m("-0.01"), market.fundingRateCap).toFixed(),
+    ).toBe("-0.00375");
+    expect(
+      calculateFundingRate(m("0.001"), market.fundingRateCap).toFixed(),
+    ).toBe("0.001");
   });
 
   it("runs when the funding interval is due", () => {
@@ -51,8 +60,8 @@ describe("funding execution", () => {
       eventId: "funding-1",
       price: {
         marketId: market.marketId,
-        markPrice: 101,
-        indexPrice: 100,
+        markPrice: m(101),
+        indexPrice: m(100),
         timestamp: FUNDING_TIME,
       },
       positions: [
@@ -62,31 +71,29 @@ describe("funding execution", () => {
       ],
     });
 
-    expect(execution).toMatchObject({
-      eventId: "funding-1",
-      marketId: "BTC-PERP",
-      markPrice: 101,
-      indexPrice: 100,
-      premiumIndex: 0.01,
-      fundingRate: 0.00375,
-      fundingTime: FUNDING_TIME,
-    });
+    expect(execution.eventId).toBe("funding-1");
+    expect(execution.marketId).toBe("BTC-PERP");
+    expect(execution.markPrice.toFixed()).toBe("101");
+    expect(execution.indexPrice.toFixed()).toBe("100");
+    expect(execution.premiumIndex.toFixed()).toBe("0.01");
+    expect(execution.fundingRate.toFixed()).toBe("0.00375");
+    expect(execution.fundingTime).toBe(FUNDING_TIME);
+
     expect(execution.payments).toHaveLength(2);
-    expect(execution.payments[0]).toMatchObject({
-      id: "funding-1:long:BTC-PERP",
-      userId: "long",
-      positionQuantity: 2,
-      paymentAmount: -0.7575,
-    });
-    expect(execution.payments[1]).toMatchObject({
-      id: "funding-1:short:BTC-PERP",
-      userId: "short",
-      positionQuantity: -2,
-      paymentAmount: 0.7575,
-    });
-    expect(
-      execution.payments.reduce((sum, payment) => sum + payment.paymentAmount, 0),
-    ).toBe(0);
+    expect(execution.payments[0]?.id).toBe("funding-1:long:BTC-PERP");
+    expect(execution.payments[0]?.userId).toBe("long");
+    expect(execution.payments[0]?.positionQuantity.toFixed()).toBe("2");
+    expect(execution.payments[0]?.paymentAmount.toFixed()).toBe("-0.7575");
+    expect(execution.payments[1]?.id).toBe("funding-1:short:BTC-PERP");
+    expect(execution.payments[1]?.positionQuantity.toFixed()).toBe("-2");
+    expect(execution.payments[1]?.paymentAmount.toFixed()).toBe("0.7575");
+
+    // Funding is a transfer: the two sides must sum to exactly zero, not merely close to it.
+    const net = execution.payments.reduce(
+      (sum, payment) => sum.add(payment.paymentAmount),
+      ZERO,
+    );
+    expect(net.isZero()).toBe(true);
   });
 
   it("creates negative funding payments where shorts pay longs", () => {
@@ -95,8 +102,8 @@ describe("funding execution", () => {
       eventId: "funding-2",
       price: {
         marketId: market.marketId,
-        markPrice: 99,
-        indexPrice: 100,
+        markPrice: m(99),
+        indexPrice: m(100),
         timestamp: FUNDING_TIME,
       },
       positions: [
@@ -105,15 +112,11 @@ describe("funding execution", () => {
       ],
     });
 
-    expect(execution.fundingRate).toBe(-0.00375);
-    expect(execution.payments[0]).toMatchObject({
-      userId: "long",
-      paymentAmount: 0.37125,
-    });
-    expect(execution.payments[1]).toMatchObject({
-      userId: "short",
-      paymentAmount: -0.37125,
-    });
+    expect(execution.fundingRate.toFixed()).toBe("-0.00375");
+    expect(execution.payments[0]?.userId).toBe("long");
+    expect(execution.payments[0]?.paymentAmount.toFixed()).toBe("0.37125");
+    expect(execution.payments[1]?.userId).toBe("short");
+    expect(execution.payments[1]?.paymentAmount.toFixed()).toBe("-0.37125");
   });
 
   it("applies funding payments to collateral balances with ledger entries", () => {
@@ -122,8 +125,8 @@ describe("funding execution", () => {
       eventId: "funding-3",
       price: {
         marketId: market.marketId,
-        markPrice: 101,
-        indexPrice: 100,
+        markPrice: m(101),
+        indexPrice: m(100),
         timestamp: FUNDING_TIME,
       },
       positions: [
@@ -142,45 +145,49 @@ describe("funding execution", () => {
       createdAt: FUNDING_TIME,
     });
 
-    expect(result.balances).toEqual([
-      balance({ userId: "long", total: 99.2425 }),
-      balance({ userId: "short", total: 100.7575 }),
-    ]);
-    expect(result.ledgerEntries).toMatchObject([
-      {
-        id: "funding-3:long:BTC-PERP:ledger",
-        userId: "long",
-        type: "FUNDING_PAYMENT",
-        amount: -0.7575,
-        balanceAfter: 99.2425,
-      },
-      {
-        id: "funding-3:short:BTC-PERP:ledger",
-        userId: "short",
-        type: "FUNDING_PAYMENT",
-        amount: 0.7575,
-        balanceAfter: 100.7575,
-      },
-    ]);
+    expect(result.balances[0]?.userId).toBe("long");
+    expect(result.balances[0]?.total.toFixed()).toBe("99.2425");
+    expect(result.balances[1]?.userId).toBe("short");
+    expect(result.balances[1]?.total.toFixed()).toBe("100.7575");
+
+    expect(result.ledgerEntries[0]?.id).toBe("funding-3:long:BTC-PERP:ledger");
+    expect(result.ledgerEntries[0]?.type).toBe("FUNDING_PAYMENT");
+    expect(result.ledgerEntries[0]?.amount.toFixed()).toBe("-0.7575");
+    expect(result.ledgerEntries[0]?.balanceAfter.toFixed()).toBe("99.2425");
+    expect(result.ledgerEntries[1]?.id).toBe("funding-3:short:BTC-PERP:ledger");
+    expect(result.ledgerEntries[1]?.amount.toFixed()).toBe("0.7575");
+    expect(result.ledgerEntries[1]?.balanceAfter.toFixed()).toBe("100.7575");
   });
 });
 
-function position(overrides: Partial<Position>): Position {
+function position(overrides: {
+  userId?: string;
+  marketId?: string;
+  quantity?: number;
+  entryPrice?: number;
+  realizedPnl?: number;
+  leverage?: number;
+}): Position {
   return {
     userId: overrides.userId ?? "user-1",
     marketId: overrides.marketId ?? market.marketId,
-    quantity: overrides.quantity ?? 0,
-    entryPrice: overrides.entryPrice ?? 100,
-    realizedPnl: overrides.realizedPnl ?? 0,
+    quantity: m(overrides.quantity ?? 0),
+    entryPrice: m(overrides.entryPrice ?? 100),
+    realizedPnl: m(overrides.realizedPnl ?? 0),
     leverage: overrides.leverage ?? 10,
   };
 }
 
-function balance(overrides: Partial<Balance>): Balance {
+function balance(overrides: {
+  userId?: string;
+  asset?: string;
+  total?: number;
+  locked?: number;
+}): Balance {
   return {
     userId: overrides.userId ?? "user-1",
     asset: overrides.asset ?? "USDC",
-    total: overrides.total ?? 0,
-    locked: overrides.locked ?? 0,
+    total: m(overrides.total ?? 0),
+    locked: m(overrides.locked ?? 0),
   };
 }

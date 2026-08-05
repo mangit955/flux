@@ -23,6 +23,7 @@
     "debug:streams": "bun run scripts/debug-stream-messages.ts"
   },
   "dependencies": {
+    "decimal.js": "^10.6.0",
     "jose": "^6.0.0"
   },
   "devDependencies": {

@@ -1,5 +1,15 @@
 import { createOutboxEvent, type JsonValue } from "../../db/src/index";
-import { checkOrderMargin } from "../../risk/src/index";
+import {
+  ZERO,
+  checkOrderMargin,
+  money,
+  moneyOr,
+  roundUpMoney,
+  toDecimalString,
+  toNumber,
+  type Money,
+  type Position,
+} from "../../risk/src/index";
 import {
   hashPassword,
   issueJwt,
@@ -14,9 +24,10 @@ import type {
   RuntimeFill,
   RuntimeMarket,
   RuntimeOrder,
+  RuntimePosition,
   RuntimeUser,
 } from "./types";
-import type { RuntimeCommand } from "./types";
+import { toRiskConfig, type RuntimeCommand } from "./types";
 import type { OrderBookCache } from "./orderbook-cache";
 import type { PriceCache } from "./price-cache";
 import { estimateMarketOrderRiskPrice, type MarketOrderRiskPrice } from "./market-order-risk";
@@ -201,17 +212,18 @@ export class PrismaApiRuntime implements ApiRuntime {
       const existing = await tx.balance.findUnique({
         where: { userId_asset: { userId, asset } },
       });
-      const nextTotal = decimal(existing, "total") + amount;
+      const deposited = money(amount);
+      const nextTotal = decimalOf(existing, "total").add(deposited);
       const balance = await tx.balance.upsert({
         where: { userId_asset: { userId, asset } },
         create: {
           userId,
           asset,
-          total: String(amount),
-          locked: "0",
+          total: toDecimalString(deposited),
+          locked: toDecimalString(ZERO),
         },
         update: {
-          total: String(nextTotal),
+          total: toDecimalString(nextTotal),
         },
       });
 
@@ -220,8 +232,8 @@ export class PrismaApiRuntime implements ApiRuntime {
           userId,
           asset,
           type: "DEPOSIT",
-          amount: String(amount),
-          balanceAfter: String(nextTotal),
+          amount: toDecimalString(deposited),
+          balanceAfter: toDecimalString(nextTotal),
         },
       });
 
@@ -243,18 +255,19 @@ export class PrismaApiRuntime implements ApiRuntime {
         where: { userId_asset: { userId, asset } },
       });
       
-      const total = decimal(existing, "total");
-      const locked = decimal(existing, "locked");
-      
-      if (total - locked < amount) {
+      const withdrawn = money(amount);
+      const total = decimalOf(existing, "total");
+      const locked = decimalOf(existing, "locked");
+
+      if (total.sub(locked).lt(withdrawn)) {
         throw new Error("insufficient available balance");
       }
-      
-      const nextTotal = total - amount;
+
+      const nextTotal = total.sub(withdrawn);
       const balance = await tx.balance.update({
         where: { userId_asset: { userId, asset } },
         data: {
-          total: String(nextTotal),
+          total: toDecimalString(nextTotal),
         },
       });
 
@@ -263,8 +276,8 @@ export class PrismaApiRuntime implements ApiRuntime {
           userId,
           asset,
           type: "WITHDRAW",
-          amount: String(amount),
-          balanceAfter: String(nextTotal),
+          amount: toDecimalString(withdrawn),
+          balanceAfter: toDecimalString(nextTotal),
         },
       });
 
@@ -303,37 +316,40 @@ export class PrismaApiRuntime implements ApiRuntime {
       {
         userId: input.userId,
         collateralAsset: market.quoteAsset,
-        walletBalance: balance.total,
-        positions: positions.map(mapPosition),
+        walletBalance: money(balance.total),
+        positions: positions.map(riskPosition),
         openOrders: openOrders.map((order) => ({
           marketId: String(field(order, "marketId")),
           side: field(order, "side") as "BUY" | "SELL",
-          price: decimal(order, "price"),
-          quantity: decimal(order, "remainingQuantity"),
+          price: decimalOf(order, "price"),
+          quantity: decimalOf(order, "remainingQuantity"),
           reduceOnly: Boolean(field(order, "reduceOnly")),
-          estimatedFeeRate: market.takerFeeRate,
+          estimatedFeeRate: money(market.takerFeeRate),
           leverage: input.leverage ?? DEFAULT_LEVERAGE,
         })),
       },
       {
         marketId: input.marketId,
         side: input.side,
-        price: riskPrice,
-        quantity: input.quantity,
+        price: money(riskPrice),
+        quantity: money(input.quantity),
         reduceOnly: input.reduceOnly ?? false,
-        estimatedFeeRate: market.takerFeeRate,
+        estimatedFeeRate: money(market.takerFeeRate),
         leverage: input.leverage ?? DEFAULT_LEVERAGE,
       },
-      [market],
-      [{ marketId: input.marketId, price: riskPrice }],
+      [toRiskConfig(market)],
+      [{ marketId: input.marketId, price: money(riskPrice) }],
     );
 
     if (!check.ok) {
       throw new Error(check.reason ?? "order rejected");
     }
 
-    // Calculate the margin to lock for this order
-    const marginToLock = check.requiredInitialMargin + check.requiredFee;
+    // Round the reservation away from zero: a lock quantized down leaves the position a
+    // sub-unit under-collateralized and the exchange absorbs the difference.
+    const marginToLock = roundUpMoney(
+      check.requiredInitialMargin.add(check.requiredFee),
+    );
 
     const now = this.now();
     const orderId = `order_${crypto.randomUUID()}`;
@@ -365,13 +381,13 @@ export class PrismaApiRuntime implements ApiRuntime {
       // in JS, then writing it back leaves a window in which a concurrent order reads the same
       // value, so both pass the check and the second write silently overwrites the first. The
       // arithmetic also stays in Postgres `numeric` rather than round-tripping through a float.
-      if (marginToLock > 0 && !input.reduceOnly) {
+      if (marginToLock.gt(ZERO) && !input.reduceOnly) {
         const locked = await tx.$executeRawUnsafe(
           `UPDATE "balances"
               SET "locked" = "locked" + $1::numeric, "updatedAt" = NOW()
             WHERE "userId" = $2 AND "asset" = $3
               AND "total" - "locked" >= $1::numeric`,
-          String(marginToLock),
+          toDecimalString(marginToLock),
           input.userId,
           market.quoteAsset,
         );
@@ -401,11 +417,11 @@ export class PrismaApiRuntime implements ApiRuntime {
           side: order.side,
           type: order.type,
           timeInForce: order.timeInForce,
-          price: order.price == null ? null : String(order.price),
-          quantity: String(order.quantity),
-          remainingQuantity: String(order.remainingQuantity),
+          price: order.price == null ? null : toDecimalString(money(order.price)),
+          quantity: toDecimalString(money(order.quantity)),
+          remainingQuantity: toDecimalString(money(order.remainingQuantity)),
           // Record what was actually locked so the release path never has to reconstruct it.
-          lockedMargin: String(input.reduceOnly ? 0 : marginToLock),
+          lockedMargin: toDecimalString(input.reduceOnly ? ZERO : marginToLock),
           leverage: order.leverage,
           reduceOnly: order.reduceOnly,
           postOnly: order.postOnly,
@@ -472,7 +488,7 @@ export class PrismaApiRuntime implements ApiRuntime {
       .map(mapBalance);
   }
 
-  async listPositions(userId: string): Promise<unknown[]> {
+  async listPositions(userId: string): Promise<RuntimePosition[]> {
     return (await this.options.client.position.findMany({ where: { userId } }))
       .map(mapPosition);
   }
@@ -629,13 +645,26 @@ function mapBalance(row: unknown): RuntimeBalance {
   };
 }
 
-function mapPosition(row: unknown) {
+/** The API DTO: plain numbers, for JSON. */
+function mapPosition(row: unknown): RuntimePosition {
   return {
     userId: String(field(row, "userId")),
     marketId: String(field(row, "marketId")),
     quantity: decimal(row, "quantity"),
     entryPrice: decimal(row, "entryPrice"),
     realizedPnl: decimal(row, "realizedPnl"),
+    leverage: Number(field(row, "leverage")),
+  };
+}
+
+/** The exact form, for the margin calculation. */
+function riskPosition(row: unknown): Position {
+  return {
+    userId: String(field(row, "userId")),
+    marketId: String(field(row, "marketId")),
+    quantity: decimalOf(row, "quantity"),
+    entryPrice: decimalOf(row, "entryPrice"),
+    realizedPnl: decimalOf(row, "realizedPnl"),
     leverage: Number(field(row, "leverage")),
   };
 }
@@ -683,17 +712,24 @@ function field(row: unknown, key: string): unknown {
   return (row as Record<string, unknown>)[key];
 }
 
-function decimal(row: unknown | null, key: string): number {
-  if (!row) {
-    return 0;
-  }
+/** Exact money from a `Decimal(36, 18)` column. Use this for anything that is computed. */
+function decimalOf(row: unknown | null, key: string): Money {
+  return row ? moneyOr(field(row, key) as string | null | undefined) : ZERO;
+}
 
-  return Number(field(row, key) ?? 0);
+/**
+ * A column as a plain number, for the API DTOs only.
+ *
+ * This is the one place precision is deliberately dropped, because `RuntimeBalance` and friends
+ * are serialized to JSON for the browser. Never feed the result back into a calculation.
+ */
+function decimal(row: unknown | null, key: string): number {
+  return toNumber(decimalOf(row, key));
 }
 
 function nullableDecimal(row: unknown, key: string): number | undefined {
   const value = field(row, key);
-  return value == null ? undefined : Number(value);
+  return value == null ? undefined : toNumber(money(value as string));
 }
 
 function nullableString(row: unknown, key: string): string | undefined {

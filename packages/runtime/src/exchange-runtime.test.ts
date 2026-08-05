@@ -34,13 +34,18 @@ describe("ExchangeRuntime integration", () => {
     expect(runtime.store.orders.get(ask.id)?.status).toBe("FILLED");
     expect(runtime.store.orders.get(bid.id)?.status).toBe("FILLED");
     expect([...runtime.store.fills.values()]).toHaveLength(2);
-    expect(runtime.store.getPosition(maker.id, "BTC-PERP")).toMatchObject({
-      quantity: -1,
-      entryPrice: 100,
-    });
-    expect(runtime.store.getPosition(taker.id, "BTC-PERP")).toMatchObject({
-      quantity: 1,
-      entryPrice: 100,
-    });
+    const makerPosition = runtime.store.getPosition(maker.id, "BTC-PERP")!;
+    expect(makerPosition.quantity.toFixed()).toBe("-1");
+    expect(makerPosition.entryPrice.toFixed()).toBe("100");
+
+    const takerPosition = runtime.store.getPosition(taker.id, "BTC-PERP")!;
+    expect(takerPosition.quantity.toFixed()).toBe("1");
+    expect(takerPosition.entryPrice.toFixed()).toBe("100");
+
+    // The API/websocket DTO must stay plain JSON numbers: a Decimal that reaches
+    // JSON.stringify serializes as a string and silently changes the wire contract.
+    const [dto] = runtime.store.positionsFor(taker.id);
+    expect(dto?.quantity).toBe(1);
+    expect(JSON.parse(JSON.stringify(dto)).quantity).toBe(1);
   });
 });

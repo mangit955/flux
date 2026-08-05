@@ -1,5 +1,5 @@
 import type { EngineEvent, NewOrderCommand, CancelOrderCommand } from "../../matching-engine/index";
-import type { MarketRiskConfig, Position } from "../../risk/src/index";
+import { money, type MarketRiskConfig, type Position } from "../../risk/src/index";
 
 export interface RuntimeUser {
   id: string;
@@ -41,6 +41,16 @@ export interface RuntimeOrder {
   updatedAt: number;
 }
 
+/** A position as the HTTP API exposes it: plain numbers, for JSON. */
+export interface RuntimePosition {
+  userId: string;
+  marketId: string;
+  quantity: number;
+  entryPrice: number;
+  realizedPnl: number;
+  leverage: number;
+}
+
 export interface RuntimeFill {
   id: string;
   tradeId: string;
@@ -57,13 +67,43 @@ export interface RuntimeFill {
   createdAt: number;
 }
 
-export interface RuntimeMarket extends MarketRiskConfig {
+/**
+ * A market as the HTTP and websocket APIs expose it.
+ *
+ * Deliberately *not* `extends MarketRiskConfig`: that type carries `Decimal` money now, and
+ * `GET /markets` serializes this straight to the browser, where a `Decimal` renders as
+ * `{"s":1,"e":1,"d":[…]}`. The rates are held as plain numbers here and converted back into
+ * exact money with `toRiskConfig` at the risk-calculation boundary.
+ */
+export interface RuntimeMarket {
+  marketId: string;
   symbol: string;
   baseAsset: string;
   quoteAsset: string;
+  tickSize: number;
+  lotSize: number;
+  maxLeverage: number;
+  initialMarginRate: number;
+  maintenanceMarginRate: number;
+  makerFeeRate: number;
+  takerFeeRate: number;
   fundingIntervalHours: number;
   fundingRateCap: number;
   status: "ACTIVE" | "PAUSED";
+}
+
+/** Lift an API market into the exact-money config the risk package works in. */
+export function toRiskConfig(market: RuntimeMarket): MarketRiskConfig {
+  return {
+    marketId: market.marketId,
+    tickSize: money(market.tickSize),
+    lotSize: money(market.lotSize),
+    maxLeverage: market.maxLeverage,
+    initialMarginRate: money(market.initialMarginRate),
+    maintenanceMarginRate: money(market.maintenanceMarginRate),
+    makerFeeRate: money(market.makerFeeRate),
+    takerFeeRate: money(market.takerFeeRate),
+  };
 }
 
 export interface RuntimeStateSnapshot {

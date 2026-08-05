@@ -4,12 +4,16 @@ import {
   type TradeExecuted,
 } from "../../matching-engine/index";
 import {
+  ZERO,
   applyFillToPosition,
   emptyPosition,
+  money,
+  toNumber,
   type FillInput,
+  type Money,
 } from "../../risk/src/index";
 import { commandStream, eventStream, type StreamBus } from "./stream";
-import type { RuntimeCommand, RuntimeFill, RuntimeOrder } from "./types";
+import { toRiskConfig, type RuntimeCommand, type RuntimeFill, type RuntimeOrder } from "./types";
 import type { RuntimeStore } from "./store";
 
 /** Leverage assumed when the order that opened the position is no longer in the store. */
@@ -19,8 +23,8 @@ const DEFAULT_LEVERAGE = 10;
 interface RoleFillOutcome {
   userId: string;
   asset: string;
-  fee: number;
-  realizedPnlDelta: number;
+  fee: Money;
+  realizedPnlDelta: Money;
 }
 
 // WebSocket hub interface for event publishing
@@ -217,7 +221,7 @@ export class RuntimePersistenceWorker {
 
     try {
       // Publish updated positions
-      const positions = [...this.store.positions.values()].filter(p => p.userId === userId);
+      const positions = this.store.positionsFor(userId);
       this.hub.publish({
         channel: "positions",
         userId,
@@ -225,7 +229,7 @@ export class RuntimePersistenceWorker {
       });
 
       // Publish updated balances  
-      const balances = [...this.store.balances.values()].filter(b => b.userId === userId);
+      const balances = this.store.balancesFor(userId);
       this.hub.publish({
         channel: "balances",
         userId,
@@ -289,20 +293,23 @@ export class RuntimePersistenceWorker {
         event.market,
         this.store.orders.get(orderId)?.leverage ?? DEFAULT_LEVERAGE,
       );
+    // The matching engine still works in floats, so its values are parsed into exact decimals
+    // here, at the boundary. Mirrors the ordering in `PersistenceService`.
+    const price = money(event.priceTicks);
+    const quantity = money(event.qtyLots);
     // Charged by liquidity role, not always at the taker rate — providing liquidity is cheaper.
-    const fee =
-      event.priceTicks *
-      event.qtyLots *
-      (role === "MAKER" ? market.makerFeeRate : market.takerFeeRate);
+    const fee = price
+      .mul(quantity)
+      .mul(role === "MAKER" ? market.makerFeeRate : market.takerFeeRate);
     const fill: FillInput = {
       userId,
       marketId: event.market,
       side: side === "buy" ? "BUY" : "SELL",
-      price: event.priceTicks,
-      quantity: event.qtyLots,
+      price,
+      quantity,
       fee,
     };
-    const result = applyFillToPosition(existing, fill, market);
+    const result = applyFillToPosition(existing, fill, toRiskConfig(market));
     this.store.setPosition(result.next);
 
     return {
@@ -315,7 +322,7 @@ export class RuntimePersistenceWorker {
 
   /** Credit gross realized PnL and debit the trading fee — the in-memory twin of `settleRoleFill`. */
   private settleRoleFill(event: TradeExecuted, outcome: RoleFillOutcome): void {
-    if (outcome.realizedPnlDelta !== 0) {
+    if (!outcome.realizedPnlDelta.isZero()) {
       this.store.settleBalance(
         outcome.userId,
         outcome.asset,
@@ -323,8 +330,8 @@ export class RuntimePersistenceWorker {
       );
     }
 
-    if (outcome.fee > 0) {
-      this.store.settleBalance(outcome.userId, outcome.asset, -outcome.fee);
+    if (outcome.fee.gt(ZERO)) {
+      this.store.settleBalance(outcome.userId, outcome.asset, outcome.fee.neg());
     }
   }
 
@@ -357,8 +364,8 @@ function fillFromTrade(
     price: event.priceTicks,
     quantity: event.qtyLots,
     notional: tradeValue,
-    fee: outcome.fee,
-    realizedPnl: outcome.realizedPnlDelta,
+    fee: toNumber(outcome.fee),
+    realizedPnl: toNumber(outcome.realizedPnlDelta),
     createdAt: event.timestamp,
   };
 }

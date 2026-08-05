@@ -1,3 +1,4 @@
+import { Decimal, ZERO, money, type Money } from "./decimal";
 import type {
   FillInput,
   MarketRiskConfig,
@@ -7,6 +8,15 @@ import type {
   PositionView,
 } from "./types";
 
+/**
+ * Quantities below this are treated as a fully closed position.
+ *
+ * Still needed after the move to exact arithmetic: fill quantities originate in the matching
+ * engine, which subtracts them in float (`orderbook.ts:285-287`), so a sequence of partial fills
+ * can close a position to a residue rather than to exactly zero.
+ */
+const DUST = money("1e-12");
+
 export function emptyPosition(
   userId: string,
   marketId: string,
@@ -15,9 +25,9 @@ export function emptyPosition(
   return {
     userId,
     marketId,
-    quantity: 0,
-    entryPrice: 0,
-    realizedPnl: 0,
+    quantity: ZERO,
+    entryPrice: ZERO,
+    realizedPnl: ZERO,
     leverage,
   };
 }
@@ -35,30 +45,30 @@ export function applyFillToPosition(
     position ?? emptyPosition(fill.userId, fill.marketId),
   );
   const signedFillQuantity =
-    fill.side === "BUY" ? fill.quantity : -fill.quantity;
+    fill.side === "BUY" ? fill.quantity : fill.quantity.neg();
   const sameDirection =
-    previous.quantity === 0 ||
-    Math.sign(previous.quantity) === Math.sign(signedFillQuantity);
+    previous.quantity.isZero() ||
+    previous.quantity.s === signedFillQuantity.s;
 
-  let nextQuantity = previous.quantity + signedFillQuantity;
+  let nextQuantity = previous.quantity.add(signedFillQuantity);
   let nextEntryPrice = previous.entryPrice;
-  let realizedPnlDelta = 0;
-  let closedQuantity = 0;
-  let openedQuantity = 0;
+  let realizedPnlDelta = ZERO;
+  let closedQuantity = ZERO;
+  let openedQuantity = ZERO;
 
   if (sameDirection) {
-    const previousAbsQuantity = Math.abs(previous.quantity);
-    const nextAbsQuantity = Math.abs(nextQuantity);
+    const previousAbsQuantity = previous.quantity.abs();
+    const nextAbsQuantity = nextQuantity.abs();
 
-    nextEntryPrice =
-      nextAbsQuantity === 0
-        ? 0
-        : (previous.entryPrice * previousAbsQuantity +
-            fill.price * fill.quantity) /
-          nextAbsQuantity;
+    nextEntryPrice = nextAbsQuantity.isZero()
+      ? ZERO
+      : previous.entryPrice
+          .mul(previousAbsQuantity)
+          .add(fill.price.mul(fill.quantity))
+          .div(nextAbsQuantity);
     openedQuantity = fill.quantity;
   } else {
-    closedQuantity = Math.min(Math.abs(previous.quantity), fill.quantity);
+    closedQuantity = Decimal.min(previous.quantity.abs(), fill.quantity);
     realizedPnlDelta = calculateRealizedPnl(
       previous.quantity,
       previous.entryPrice,
@@ -66,10 +76,10 @@ export function applyFillToPosition(
       closedQuantity,
     );
 
-    if (nextQuantity === 0) {
-      nextEntryPrice = 0;
-    } else if (Math.sign(nextQuantity) !== Math.sign(previous.quantity)) {
-      openedQuantity = Math.abs(nextQuantity);
+    if (nextQuantity.isZero()) {
+      nextEntryPrice = ZERO;
+    } else if (nextQuantity.s !== previous.quantity.s) {
+      openedQuantity = nextQuantity.abs();
       nextEntryPrice = fill.price;
     } else {
       nextEntryPrice = previous.entryPrice;
@@ -77,37 +87,35 @@ export function applyFillToPosition(
   }
 
   if (isDust(nextQuantity)) {
-    nextQuantity = 0;
-    nextEntryPrice = 0;
+    nextQuantity = ZERO;
+    nextEntryPrice = ZERO;
   }
 
   const next: Position = {
     ...previous,
     userId: fill.userId,
     marketId: fill.marketId,
-    quantity: roundFinancial(nextQuantity),
-    entryPrice: roundFinancial(nextEntryPrice),
-    realizedPnl: roundFinancial(
-      previous.realizedPnl + realizedPnlDelta - fill.fee,
-    ),
+    quantity: nextQuantity,
+    entryPrice: nextEntryPrice,
+    realizedPnl: previous.realizedPnl.add(realizedPnlDelta).sub(fill.fee),
   };
 
   return {
     previous,
     next,
-    closedQuantity: roundFinancial(closedQuantity),
-    openedQuantity: roundFinancial(openedQuantity),
-    realizedPnlDelta: roundFinancial(realizedPnlDelta),
+    closedQuantity,
+    openedQuantity,
+    realizedPnlDelta,
     feePaid: fill.fee,
   };
 }
 
 export function positionSide(position: Pick<Position, "quantity">): PositionSide {
-  if (position.quantity > 0) {
+  if (position.quantity.gt(ZERO)) {
     return "LONG";
   }
 
-  if (position.quantity < 0) {
+  if (position.quantity.lt(ZERO)) {
     return "SHORT";
   }
 
@@ -116,56 +124,54 @@ export function positionSide(position: Pick<Position, "quantity">): PositionSide
 
 export function calculateUnrealizedPnl(
   position: Pick<Position, "quantity" | "entryPrice">,
-  markPrice: number,
-): number {
-  if (position.quantity === 0) {
-    return 0;
+  markPrice: Money,
+): Money {
+  if (position.quantity.isZero()) {
+    return ZERO;
   }
 
-  return roundFinancial((markPrice - position.entryPrice) * position.quantity);
+  return markPrice.sub(position.entryPrice).mul(position.quantity);
 }
 
 export function positionNotional(
   position: Pick<Position, "quantity">,
-  markPrice: number,
-): number {
-  return roundFinancial(Math.abs(position.quantity) * markPrice);
+  markPrice: Money,
+): Money {
+  return position.quantity.abs().mul(markPrice);
 }
 
 export function viewPosition(
   position: Position,
   market: MarketRiskConfig,
-  markPrice: number,
+  markPrice: Money,
 ): PositionView {
   const notional = positionNotional(position, markPrice);
-  const initialMargin = notional / position.leverage;
-  const maintenanceMargin = notional * market.maintenanceMarginRate;
 
   return {
     ...position,
     side: positionSide(position),
     notional,
     unrealizedPnl: calculateUnrealizedPnl(position, markPrice),
-    initialMargin: roundFinancial(initialMargin),
-    maintenanceMargin: roundFinancial(maintenanceMargin),
+    initialMargin: notional.div(position.leverage),
+    maintenanceMargin: notional.mul(market.maintenanceMarginRate),
   };
 }
 
 function calculateRealizedPnl(
-  previousQuantity: number,
-  entryPrice: number,
-  fillPrice: number,
-  closedQuantity: number,
-): number {
-  if (previousQuantity > 0) {
-    return (fillPrice - entryPrice) * closedQuantity;
+  previousQuantity: Money,
+  entryPrice: Money,
+  fillPrice: Money,
+  closedQuantity: Money,
+): Money {
+  if (previousQuantity.gt(ZERO)) {
+    return fillPrice.sub(entryPrice).mul(closedQuantity);
   }
 
-  return (entryPrice - fillPrice) * closedQuantity;
+  return entryPrice.sub(fillPrice).mul(closedQuantity);
 }
 
-function assertPositive(value: number, label: string): void {
-  if (!Number.isFinite(value) || value <= 0) {
+function assertPositive(value: Money, label: string): void {
+  if (!value.isFinite() || value.lte(ZERO)) {
     throw new Error(`${label} must be positive`);
   }
 }
@@ -182,10 +188,6 @@ function clonePosition(position: Position): Position {
   return { ...position };
 }
 
-function isDust(value: number): boolean {
-  return Math.abs(value) < 1e-12;
-}
-
-function roundFinancial(value: number): number {
-  return Number(value.toFixed(12));
+function isDust(value: Money): boolean {
+  return value.abs().lt(DUST);
 }

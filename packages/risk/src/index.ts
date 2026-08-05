@@ -1,4 +1,15 @@
 export {
+  Decimal,
+  MONEY_SCALE,
+  ZERO,
+  money,
+  moneyOr,
+  roundUpMoney,
+  toDecimalString,
+  toNumber,
+} from "./decimal";
+export type { Money } from "./decimal";
+export {
   applyLedgerEntry,
   availableBalance,
   lockBalance,

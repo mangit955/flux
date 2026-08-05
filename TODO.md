@@ -150,17 +150,77 @@ verified locally are marked as such inline rather than stated as fact.
   collateral held for no reason on exactly the orders that provide liquidity.
   Found while implementing #3.
 
-- [ ] **9. Get money off floats**
-  `prisma-api-runtime.ts:681` (`decimal()` → `Number`), writes via `String(number)`.
-  `roundFinancial` (= `toFixed(12)`) patches the symptom.
-  The schema is correctly `Decimal(36,18)` and every boundary throws that away.
-  `String(1e-7)` also emits exponential notation Prisma can't parse.
-  Move to `Prisma.Decimal` or fixed-point integers end-to-end; delete `roundFinancial`.
-  **Do this after #3-#8** — migrating while the logic is still wrong means doing it twice.
+- [x] **9. Get money off floats** — done.
+  Money is now `Decimal` (decimal.js) from the Postgres column through the risk calculations and
+  back. One shared module, `packages/risk/src/decimal.ts`, replaces all **eight** private
+  helpers: five `roundFinancial` (`margin.ts`, `liquidation.ts`, `ledger.ts`, `funding.ts`,
+  `position-engine.ts`) and three `decimalString` (`persistence-service.ts`,
+  `funding-payment-mapper.ts`, `liquidation-mapper.ts`). Writes go through
+  `toDecimalString` (`toFixed(18)`), so every column holds one canonical representation.
 
-  `roundFinancial` is copy-pasted into **five** files, each a private definition, so this is
-  five deletions and not one: `margin.ts:185`, `liquidation.ts:285`, `ledger.ts:84`,
-  `funding.ts:200`, `position-engine.ts:189`.
+  **Correction to this item's original premise.** It claimed `String(1e-7)` → `"1e-7"` was
+  "exponential notation Prisma can't parse". That is false, measured against Postgres 16 and
+  Prisma 6.19: both accept `"1e-7"` and store it correctly. `toFixed(18)` is normalization, not
+  a crash fix. The real `Decimal(36, 18)` edges are that values below 1e-18 truncate silently to
+  zero and values at or above 1e18 raise `numeric field overflow` — neither notation-related.
+
+  Not `Prisma.Decimal`: CI never runs `prisma generate` (`.github/workflows/ci.yml`) and the
+  Prisma adapters are typed through `unknown` precisely so packages never import
+  `@prisma/client`.
+
+  Scope was the money core. `Decimal` is converted back to `number` at the API/websocket edge,
+  so the HTTP contract and `apps/web` are unchanged. Two leaks found and closed while doing it:
+  `RuntimeMarket extends MarketRiskConfig` put Decimal rates on `GET /markets`
+  (`types.ts:60`), and `store.positions` reached the websocket `positions` channel and
+  `GET /positions` — the latter typed `Promise<unknown[]>`, so tsc could not have caught it.
+  `RuntimeMarket` now stands alone with a `toRiskConfig()` converter, and both position paths
+  go through `RuntimePosition` DTO mappers.
+
+  Verified end to end against Postgres 16 on a clean database, workers in `RUNTIME_MODE=production`:
+  a 0.1 @ 59.91 limit order at 3x locked `1.999995500000000000` with `orders.lockedMargin` and
+  `balances.locked` byte-identical (exactly `5.991/3 + 5.991 x 0.0005`); cancelling returned
+  `locked` to `0.000000000000000000` with `total` unchanged; a 1 @ 59.91 fill charged maker
+  0.011982 and taker 0.029955; closing at 99.23 left the taker at 10039.240430 with
+  `realizedPnl` 39.240430 and the maker at the exact mirror. Books conserved to the digit —
+  deposits 30000 minus fees 0.111398 equalled total balances 29999.888602 — with every money
+  column at scale 18 and zero exponential values. `GET /markets` still returns plain JSON
+  numbers, which is the regression the `RuntimeMarket` decoupling exists to prevent.
+
+  Also corrected: `roundFinancial(12)` masked drift better than the original note implied — it
+  holds up under symmetric lock/release at small magnitudes. The demonstrable defects it could
+  *not* cover are the exponential-notation write above, and precision loss once a balance is
+  large enough to exhaust a float's ~15-17 significant digits (a 1e9 balance debited 100 × 1e-7
+  lands on 999999999.9999881 instead of 999999999.99999). Both are pinned by tests in
+  `packages/db/src/money-invariants.test.ts`.
+
+- [ ] **9c. Engine event IDs collide after recovery, stranding margin**
+  Found while running #9's end-to-end verification. `eventId` is `${market}-${sequence}` and the
+  engine's sequence counter restarts from zero when `recovery.ts` rebuilds the book, so a fresh
+  event can reuse an ID that `processed_events` already holds. `PersistenceService.persistEvent`
+  treats that as a duplicate and returns `status: "skipped"`, silently dropping the write.
+  Observed live: a rejected order emitted `BTC-PERP-20`, which matched a row processed four
+  hours earlier, so the order stayed `PENDING` and its `1.9999955` stayed locked with no error
+  logged anywhere. Unrelated to the Decimal work — it predates it and would strand collateral on
+  any event type. Make the ID unique per run (include the recovery epoch or a ULID).
+
+- [ ] **9d. Recovery loads `PENDING` orders into the book before they are matched**
+  Also found during #9 verification. `recoverOrderBook` pulled 24 orders where only 9 were
+  `OPEN`, including `PENDING` ones whose `order.created` command had not been consumed yet. When
+  the command then arrived the engine rejected it `DUPLICATE_ORDER_ID`, because recovery had
+  already inserted that order id. Any restart between an order's DB write and its command being
+  consumed loses that order. Recovery should load only orders the engine has actually accepted.
+
+- [ ] **9b. The matching engine still does float arithmetic**
+  Out of scope for #9 by decision, and worth its own item. `orderbook.ts:285-287` subtracts fill
+  quantities in float (`maker.remainingQtyLots -= qtyLots`), and `PriceLevelTree` keys levels on
+  `number` (`price-level-tree.ts:2-6`). Despite the `Ticks`/`Lots` naming these carry raw human
+  quantities (`prisma-api-runtime.ts` passes `input.quantity` and `input.price` straight
+  through), so partial fills can leave a residue rather than closing to exactly zero.
+  Persistence parses these values exactly at the boundary (`persistence-service.ts`,
+  `workers.ts`), so the drift cannot spread past the engine, and `isDust`
+  (`position-engine.ts`) still exists to absorb it — but the engine's own books remain
+  approximate. Fixing it means converting the matching hot path, the price-keyed tree, and the
+  snapshot/recovery format together.
 
 - [ ] **10. Move the margin check inside the transaction**
   `prisma-api-runtime.ts:283-320`. Balance, positions, and open orders are read in three
@@ -418,11 +478,12 @@ verified locally are marked as such inline rather than stated as fact.
 **Week 1 — credibility floor** — done.
 ~~#1, #1b, #2~~ → ~~#6, #7, #8~~ (one change fixed all three across the same five blocks)
 → ~~#5~~ → ~~#3, #4~~. Outcome: green CI, and money that actually moves correctly.
-Tier 1 now has #9, #10, #11 and the newly found #8b left.
+Tier 1 now has #10, #11 and the newly found #8b left; #9 is done, and surfaced #9b.
 
 **Week 2 — close the domain gaps**
-#9 (Decimal migration — after the logic is right, not before) → #12 (liquidation worker) →
-#11 (DLQ) → #14 (tick/lot conversion).
+~~#9 (Decimal migration — after the logic is right, not before)~~ → #12 (liquidation worker) →
+#11 (DLQ) → #14 (tick/lot conversion). #9b (engine floats) pairs naturally with #14, since both
+are about the engine's tick/lot representation.
 
 **Week 3 — API and operability**
 #20 (errors) → #21-#26 (security) → #30, #31 (logging and correlation IDs).
@@ -434,5 +495,5 @@ Two sequencing notes:
 
 - Pull #30 and #31 forward if #5 or #11 give trouble — those races are hard to diagnose
   without correlation IDs.
-- Don't start #9 before #3-#8. Migrating to Decimal while the underlying arithmetic is still
-  wrong means doing the migration twice.
+- #9 was correctly sequenced after #3-#8: the release path had to record `lockedMargin` before
+  the migration, or the exactness work would have been redone.

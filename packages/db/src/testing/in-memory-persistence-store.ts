@@ -1,3 +1,4 @@
+import { Decimal, ZERO, type Money } from "../../../risk/src/index";
 import type {
   FillWrite,
   LedgerEntryWrite,
@@ -15,8 +16,8 @@ import type {
 export interface InMemoryBalance {
   userId: string;
   asset: string;
-  total: number;
-  locked: number;
+  total: Money;
+  locked: Money;
 }
 
 export interface InMemoryPersistenceState {
@@ -166,8 +167,8 @@ class InMemoryPersistenceTransaction implements PersistenceTransaction {
     return order ? cloneOrder(order) : null;
   }
 
-  async unlockBalanceForOrder(userId: string, asset: string, amount: number): Promise<void> {
-    if (amount <= 0) {
+  async unlockBalanceForOrder(userId: string, asset: string, amount: Money): Promise<void> {
+    if (amount.lte(ZERO)) {
       return;
     }
 
@@ -177,7 +178,7 @@ class InMemoryPersistenceTransaction implements PersistenceTransaction {
       return;
     }
 
-    if (amount > balance.locked) {
+    if (amount.gt(balance.locked)) {
       console.error(
         `margin release exceeds locked balance for user ${userId} ${asset}: releasing ${amount}, locked ${balance.locked}`,
       );
@@ -185,25 +186,25 @@ class InMemoryPersistenceTransaction implements PersistenceTransaction {
 
     this.state.balances.set(balanceKey(userId, asset), {
       ...balance,
-      locked: Math.max(0, balance.locked - amount),
+      locked: Decimal.max(ZERO, balance.locked.sub(amount)),
     });
   }
 
   async adjustBalanceTotal(
     userId: string,
     asset: string,
-    delta: number,
-  ): Promise<number> {
+    delta: Money,
+  ): Promise<Money> {
     const key = balanceKey(userId, asset);
     const existing = this.state.balances.get(key) ?? {
       userId,
       asset,
-      total: 0,
-      locked: 0,
+      total: ZERO,
+      locked: ZERO,
     };
-    const total = Number((existing.total + delta).toFixed(12));
+    const total = existing.total.add(delta);
 
-    if (total < 0) {
+    if (total.isNegative()) {
       console.error(
         `balance went negative for user ${userId} ${asset}: ${total} after ${delta}`,
       );
