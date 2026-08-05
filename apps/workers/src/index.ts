@@ -1,12 +1,20 @@
 import {
   ExchangeRuntime,
+  LiquidationWorker,
   OutboxPublisher,
+  PriceCacheMarkPriceSource,
+  PrismaApiRuntime,
+  PrismaLiquidationStore,
   ProductionMatchingWorker,
   ProductionPersistenceWorker,
   RedisStreamBus,
   RedisOrderBookCache,
+  RedisPriceCache,
   type OrderRecoveryClient,
   type OutboxPublisherClient,
+  type PrismaApiClient,
+  type PrismaLiquidationClient,
+  type RuntimeMarket,
 } from "../../../packages/runtime/src/index";
 import { PersistenceService, PrismaPersistenceStore } from "../../../packages/db/src/index";
 import type { PrismaClientLike } from "../../../packages/db/src/index";
@@ -82,7 +90,7 @@ async function runProductionWorkers(): Promise<void> {
         orderBy: { id: "asc" },
       });
 
-      return rows.map((row: { id: string }) => row.id);
+      return rows.map((row: unknown) => String((row as { id: string }).id));
     };
     
     // Test database connection
@@ -104,6 +112,15 @@ async function runProductionWorkers(): Promise<void> {
       markets,
     );
     console.log("✓ Persistence worker created");
+
+    const liquidation =
+      role === "all" || role === "liquidation"
+        ? createLiquidationWorker(client, redisUrl)
+        : undefined;
+
+    if (liquidation) {
+      console.log("✓ Liquidation worker created");
+    }
 
     console.log("🔄 Recovering matching engine state...");
     await matching.recover();
@@ -158,15 +175,69 @@ async function runProductionWorkers(): Promise<void> {
 
     // Kick off the first poll
     setTimeout(poll, intervalMs);
+
+    if (liquidation) {
+      // Its own, slower cadence: a margin scan reads every open position, which is far too much
+      // work for the 100ms command-processing tick.
+      const liquidationIntervalMs = Number(Bun.env.LIQUIDATION_INTERVAL_MS ?? 1000);
+      const scan = async () => {
+        try {
+          const actions = await liquidation.processOnce();
+
+          if (actions > 0) {
+            console.log(`[LIQUIDATION] ${actions} action(s) taken`);
+          }
+        } catch (error) {
+          console.error("[LIQUIDATION] scan failed:", error);
+        }
+
+        setTimeout(scan, liquidationIntervalMs);
+      };
+
+      setTimeout(scan, liquidationIntervalMs);
+      console.log(`✓ Liquidation scan every ${liquidationIntervalMs}ms`);
+    }
   } catch (error) {
     console.error("❌ Failed to start production workers:", error);
     throw error;
   }
 }
 
+/**
+ * The liquidation worker submits its forced closes through `PrismaApiRuntime`, so a liquidation
+ * order takes exactly the same path as a user order — margin check, order row, outbox, command
+ * stream. Reduce-only orders reserve no collateral, so nothing about the money path changes.
+ *
+ * Single instance only: two replicas scanning the same positions would each submit a close and
+ * double the size being liquidated. TODO #16 (leader election) covers this worker too.
+ */
+function createLiquidationWorker(
+  client: WorkerPrismaClient,
+  redisUrl: string,
+): LiquidationWorker {
+  const apiRuntime = new PrismaApiRuntime({
+    client,
+    // Never used — the worker calls neither login nor authenticate — but a blank secret must not
+    // be silently accepted, in case a future caller does.
+    jwtSecret: requiredEnv("JWT_SECRET"),
+  });
+
+  return new LiquidationWorker({
+    store: new PrismaLiquidationStore(client),
+    submitter: apiRuntime,
+    markPrices: new PriceCacheMarkPriceSource(new RedisPriceCache({ redisUrl })),
+    markets: async () =>
+      (await apiRuntime.listMarkets()).filter(
+        (market: RuntimeMarket) => market.status === "ACTIVE",
+      ),
+  });
+}
+
 type WorkerPrismaClient = PrismaClientLike &
   OutboxPublisherClient &
-  OrderRecoveryClient & {
+  OrderRecoveryClient &
+  PrismaApiClient &
+  PrismaLiquidationClient & {
     market: {
       findMany(args: unknown): Promise<Array<{ id: string }>>;
     };

@@ -249,6 +249,9 @@ export class RuntimePersistenceWorker {
   }
 
   private applyTrade(event: TradeExecuted): void {
+    // Local mode's stand-in for a mark price: the liquidation scan has no Binance feed here.
+    this.store.setLastTradePrice(event.market, money(event.priceTicks));
+
     // Positions first: the fill row records the realized PnL that only exists once the position
     // update has run. Mirrors the ordering in PersistenceService.
     const maker = this.applyFillToPosition(event, "MAKER");

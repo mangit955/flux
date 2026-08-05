@@ -5,6 +5,9 @@ import { RuntimeStore } from "./store";
 import { toRiskConfig, type RuntimeCommand, type RuntimeOrder } from "./types";
 import { MatchingWorker, RuntimePersistenceWorker } from "./workers";
 import { estimateMarketOrderRiskPrice, type MarketOrderRiskPrice } from "./market-order-risk";
+import { InMemoryLiquidationStore } from "./in-memory-liquidation-store";
+import { LiquidationWorker } from "./liquidation-worker";
+import { LocalMarkPriceSource } from "./local-mark-price";
 
 /** Leverage assumed when the caller does not specify one. */
 const DEFAULT_LEVERAGE = 10;
@@ -39,6 +42,8 @@ export class ExchangeRuntime {
   readonly engine: MatchingEngine;
   readonly matchingWorker: MatchingWorker;
   readonly persistenceWorker: RuntimePersistenceWorker;
+  readonly liquidationStore: InMemoryLiquidationStore;
+  readonly liquidationWorker: LiquidationWorker;
 
   constructor(input: {
     store?: RuntimeStore;
@@ -57,11 +62,19 @@ export class ExchangeRuntime {
       input.hub
     );
     this.persistenceWorker = new RuntimePersistenceWorker(
-      this.bus, 
-      this.store, 
+      this.bus,
+      this.store,
       () => [...this.store.markets.keys()],
       input.hub
     );
+    this.liquidationStore = new InMemoryLiquidationStore(this.store);
+    this.liquidationWorker = new LiquidationWorker({
+      store: this.liquidationStore,
+      submitter: this,
+      markPrices: new LocalMarkPriceSource(this.store, this.engine),
+      markets: () => [...this.store.markets.values()],
+      clock: input.clock,
+    });
   }
 
   register(email: string, password: string, now = Date.now()) {
@@ -200,9 +213,12 @@ export class ExchangeRuntime {
     for (let index = 0; index < maxIterations; index += 1) {
       const matched = await this.matchingWorker.processOnce();
       const persisted = await this.persistenceWorker.processOnce();
-      processed += matched + persisted;
+      // Runs after persistence: it marks positions to the last *settled* trade, and any order it
+      // submits is picked up by the matching worker on the next iteration.
+      const liquidated = await this.liquidationWorker.processOnce();
+      processed += matched + persisted + liquidated;
 
-      if (matched + persisted === 0) {
+      if (matched + persisted + liquidated === 0) {
         break;
       }
     }

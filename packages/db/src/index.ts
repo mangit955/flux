@@ -36,6 +36,7 @@ export type {
   FillWrite,
   FundingPaymentWrite,
   JsonValue,
+  LedgerEntryWrite,
   LiquidationWrite,
   MarketWrite,
   OrderStatusUpdate,

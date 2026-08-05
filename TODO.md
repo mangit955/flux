@@ -239,16 +239,69 @@ verified locally are marked as such inline rather than stated as fact.
 
 ## Tier 2 — Broken invariants and missing subsystems
 
-- [ ] **12. Wire up the liquidation engine**
-  `packages/risk/src/liquidation.ts` — `createLiquidationTriggers`, `useInsuranceFund`,
-  `calculateAdlScore`, `createLiquidationOrder`, `settleLiquidationDeficit`, and
-  `createAdlActions`, plus `isMaintenanceMarginViolated` (which lives in
-  `packages/risk/src/margin.ts:116`, not in `liquidation.ts`), have **zero production
-  callers** — verified: no references outside `packages/risk`. The system offers 20x
-  leverage with no mechanism to close underwater positions, and the insurance fund table is
-  never written to. README claims Phase 5 is implemented.
-  A worker that scans positions against mark price and submits liquidation orders is roughly
-  200 lines; the functions are already written and unit-tested.
+- [x] **12. Wire up the liquidation engine**
+  `LiquidationWorker` (`packages/runtime/src/liquidation-worker.ts`) now scans open positions
+  against mark price, force-closes violators, and settles what the close leaves behind. It runs
+  in both runtimes over one port, `LiquidationStore` (`liquidation-store.ts`), with
+  `InMemoryLiquidationStore` and `PrismaLiquidationStore` behind it — the `PersistenceStore`
+  pattern, so the whole thing is testable with no Docker.
+
+  The worker holds no money arithmetic of its own: it feeds `createLiquidationTriggers` and
+  `useInsuranceFund` and writes the result back through the store. Scan and settlement are
+  separate passes because a forced close is asynchronous — it goes through the same command
+  stream, engine, and persistence worker as a user order, so the money it moves is not visible
+  until a later cycle.
+
+  Forced closes are **reduce-only IOC limit orders at mark ∓ 0.5%**, submitted through the
+  existing `submitOrder` path. Reduce-only reserves no collateral (`checkOrderMargin` returns ok
+  before the margin branch; `submitOrder` locks nothing and records `lockedMargin: 0`), so the
+  money path is unchanged. IOC means an unfilled remainder expires rather than resting, and a
+  per-position cooldown stops an unfillable close from being resubmitted every tick.
+
+  **Two things the original item did not anticipate**, both found by reading the engine:
+  - *Self-trade prevention would have blocked most liquidations.* `matchIncomingOrder` stops with
+    `SELF_TRADE_PREVENTION` when the best opposite maker is the same user, and an underwater
+    account usually has resting orders. The worker cancels the user's own working orders first and
+    closes on a later scan — which also releases the collateral those orders hold, occasionally
+    lifting the account back above maintenance margin with no close at all.
+  - *The bad-debt sweep must require `locked = 0`.* Crediting a negative balance to zero while
+    collateral is still locked would leave `locked > total`.
+
+  Deficits are covered from `insurance_funds` in one transaction — conditional fund debit
+  (`WHERE "balance" >= $1`, never a read-modify-write), balance credit, and an
+  `INSURANCE_FUND_TRANSFER` row on the fund side (`userId` null) plus `LIQUIDATION_LOSS` on the
+  user. A deficit larger than the fund records `FAILED` and leaves the shortfall on the books
+  rather than forgiving it; ADL is #12b. `LedgerEntryWrite.userId` was widened to `string | null`
+  to match the nullable column. No schema or migration change was needed — every table, enum
+  member, and mapper already existed.
+
+  Verified end to end against Postgres 16 and Redis 7 in `RUNTIME_MODE=production`,
+  `WORKER_ROLE=all`: a 1 ETH-PERP long opened at 100 on 20x against a 10 USDC balance, then marked
+  to 90. Equity −0.05 against maintenance margin 0.45 triggered it; the worker submitted
+  `SELL LIMIT IOC 1 @ 89.550000000000000000` (90 × 0.995) with `lockedMargin 0`, which filled and
+  left the position `FLAT` with `realizedPnl −10.095`. Balance went to
+  `0.000000000000000000` with `locked 0`, the fund moved 1000000 → `999999.905000000000000000`
+  — exactly the 0.095 deficit — and both ledger rows carry the liquidation id as `referenceId`.
+  `liquidations` ended `INSURANCE_FUND_USED` with `insuranceFundUsed 0.095`. No account violated
+  `locked <= total` and no balance stayed negative.
+
+  Not exercised live: the cancel-first path (the test account had no other working orders) and the
+  `FAILED` branch. Both are covered by the 12 tests in `liquidation-worker.test.ts`.
+
+- [ ] **12b. Wire up ADL, and give the insurance fund an income**
+  Left over from #12 by decision. `settleLiquidationDeficit` and `createAdlActions` are still
+  uncalled: when the fund cannot cover a deficit the liquidation is recorded `FAILED` and the
+  shortfall stays as a negative balance. ADL needs its own fill/position/ledger writes with no
+  matching-engine trade behind them, which is why it was split out.
+  Separately, **nothing ever credits `insurance_funds`** — it only ever drains from the seeded
+  1,000,000. Real exchanges fund it from liquidation surplus (the margin left when a position
+  closes better than its bankruptcy price) and a liquidation penalty fee. Neither is modelled;
+  there is no penalty-rate column on `markets`.
+
+- [ ] **12c. The liquidation worker must be single-instance**
+  Covered by #16, noted here because it is a new instance of that defect: two replicas scanning
+  the same positions would each submit a close and liquidate twice the size. It is gated behind
+  `WORKER_ROLE` today, with nothing enforcing that only one process holds that role.
 
 - [ ] **13. Wire up funding**
   `packages/risk/src/funding.ts` — `applyFundingPayments`, `shouldExecuteFunding`,
@@ -481,9 +534,11 @@ verified locally are marked as such inline rather than stated as fact.
 Tier 1 now has #10, #11 and the newly found #8b left; #9 is done, and surfaced #9b.
 
 **Week 2 — close the domain gaps**
-~~#9 (Decimal migration — after the logic is right, not before)~~ → #12 (liquidation worker) →
+~~#9 (Decimal migration — after the logic is right, not before)~~ → ~~#12 (liquidation worker)~~ →
 #11 (DLQ) → #14 (tick/lot conversion). #9b (engine floats) pairs naturally with #14, since both
-are about the engine's tick/lot representation.
+are about the engine's tick/lot representation. #12 surfaced #12b (ADL and insurance-fund income)
+and #12c; #13 (funding) is the remaining unwired subsystem and should follow the same
+port-plus-two-stores shape the liquidation worker established.
 
 **Week 3 — API and operability**
 #20 (errors) → #21-#26 (security) → #30, #31 (logging and correlation IDs).
