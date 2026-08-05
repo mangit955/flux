@@ -83,7 +83,11 @@ export interface FillWrite {
 
 export interface LedgerEntryWrite {
   id: string;
-  userId: string;
+  /**
+   * Null for entries that move exchange money rather than a user's — the insurance-fund side of a
+   * liquidation. The column is nullable (`prisma/schema.prisma`, `LedgerEntry.userId String?`).
+   */
+  userId: string | null;
   asset: string;
   type: DurableLedgerEntryType;
   amount: string;

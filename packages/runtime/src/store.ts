@@ -37,6 +37,13 @@ export class RuntimeStore {
   readonly fills = new Map<string, RuntimeFill>();
   readonly positions = new Map<string, Position>();
   readonly processedEvents = new Set<string>();
+  /**
+   * Last traded price per market.
+   *
+   * Local mode has no mark-price feed — `apps/market-data` only runs against Redis — so this is
+   * what the liquidation scan marks positions to, falling back to the book mid.
+   */
+  private readonly lastTradePrices = new Map<string, Money>();
 
   constructor() {
     this.seedMarkets();
@@ -166,6 +173,14 @@ export class RuntimeStore {
 
   setPosition(position: Position): void {
     this.positions.set(positionKey(position.userId, position.marketId), position);
+  }
+
+  setLastTradePrice(marketId: string, price: Money): void {
+    this.lastTradePrices.set(marketId, price);
+  }
+
+  getLastTradePrice(marketId: string): Money | undefined {
+    return this.lastTradePrices.get(marketId);
   }
 
   snapshot(): RuntimeStateSnapshot {
