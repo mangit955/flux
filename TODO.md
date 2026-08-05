@@ -3,7 +3,11 @@
 Engineering backlog from a code review of the exchange backend. Ordered by tier;
 Tier 0 and Tier 1 are correctness issues in the money path and block everything else.
 
-File references are `path:line` at the time of review — verify before editing.
+File references are `path:line` — re-verified against source on 2026-08-05, but they drift with
+every edit, so confirm before acting on one.
+
+Every open item below was checked against the code on 2026-08-05. Claims that could not be
+verified locally are marked as such inline rather than stated as fact.
 
 ---
 
@@ -40,17 +44,27 @@ File references are `path:line` at the time of review — verify before editing.
 ## Tier 1 — Correctness in the money path
 
 - [ ] **3. Charge fees on fills**
-  `packages/db/src/persistence-service.ts:279` (`fee: 0`), `:342`, `:359` (`fee: "0"`).
-  Fills are written with a hardcoded zero fee, so the exchange collects nothing while
-  `checkOrderMargin` reserves `requiredFee` on every order.
+  `packages/db/src/persistence-service.ts:279` (`fee: 0`), `:342`, `:358` (`fee: "0"`).
+  Fills are written with a hardcoded zero fee **in the production path**, so the exchange
+  collects nothing while `checkOrderMargin` reserves `requiredFee` on every order.
   Compute maker/taker fee from `market.makerFeeRate` / `takerFeeRate`, debit `balance.total`,
   write a `LedgerEntry`.
 
-- [ ] **4. Credit realized PnL to balances**
-  `persistence-service.ts:343`, `:359` (`realizedPnl: "0"`).
-  `applyFillToPosition` computes realized PnL correctly and the result is discarded, so a user
-  can open a position, have it move in their favour, close it, and receive nothing.
-  Persist it on the fill and settle it into `balance.total` in the same transaction.
+  **This is a dual-runtime change.** The in-memory path already charges a fee:
+  `packages/runtime/src/workers.ts:294` computes
+  `tradeValue * (makerFeeRate | takerFeeRate)` and debits it at `:302`. The two
+  implementations must end up agreeing — see the `dual-runtime` skill. Note both paths pass
+  `fee: 0` into `applyFillToPosition` (`workers.ts:278`, `persistence-service.ts:279`), so the
+  fee is currently excluded from the position's realized-PnL accounting in both.
+
+- [ ] **4. Settle realized PnL into balances**
+  `persistence-service.ts:343`, `:359` (`realizedPnl: "0"` on the fill rows).
+  `applyFillToPosition` computes realized PnL correctly and it *is* persisted on the position
+  row — `next.realizedPnl` accumulates at `packages/risk/src/position-engine.ts:90-92` and is
+  written by `positionToWrite` (`persistence-service.ts:419`). What never happens is
+  **settlement into `balance.total`**, so a user can open a position, have it move in their
+  favour, close it, and receive nothing spendable.
+  Persist it on the fill *and* credit `balance.total` in the same transaction.
 
 - [ ] **5. Fix the lost-update race on `balance.locked`**
   `packages/runtime/src/prisma-api-runtime.ts:360-392` and
@@ -61,29 +75,41 @@ File references are `path:line` at the time of review — verify before editing.
   `CHECK (locked <= total)` constraint as a backstop.
 
 - [ ] **6. Stop hardcoding `leverage = 10` in the unlock path**
-  `persistence-service.ts` ~lines 91, 122, 157, 196 — four duplicated copies, one with a
-  comment admitting it should be stored on the order. The lock side uses `input.leverage ?? 10`.
+  `persistence-service.ts:92, 123, 156, 193, 221` — **five** duplicated copies (not four), one
+  with a comment admitting it should be stored on the order. The lock side uses
+  `input.leverage ?? 10` (`prisma-api-runtime.ts:310, 320`; `exchange-runtime.ts:144`).
   At 20x the user gets back 2x what was locked; at 5x margin is stranded permanently.
   Store `lockedMargin` on the order row at submit time and release exactly that value.
-  This deletes all four reconstructions.
+  This deletes all five reconstructions.
+
+  Two further hardcoded-leverage sites to fix with it: `emptyPosition(userId, market, 10)` at
+  `persistence-service.ts:272` and `workers.ts:271`, against a function whose own default is
+  `leverage = 1` (`packages/risk/src/position-engine.ts:13`).
 
 - [ ] **7. Fix market orders leaking 100% of locked margin**
-  Same blocks — `Number(order.price || 0)`, and market orders have `price = null`, so
-  `totalToUnlock` is always 0. `MARKET_LIQUIDITY_EXHAUSTED` is a routine engine outcome, so
-  this fires constantly.
+  Same five blocks — `Number(order.price || 0)` at `persistence-service.ts:93, 124, 157, 194,
+  222`. `Order.price` is `Decimal?` (`prisma/schema.prisma:180`) and market orders have
+  `price = null`, so `totalToUnlock` is always 0. `MARKET_LIQUIDITY_EXHAUSTED` is a routine
+  engine outcome, so this fires constantly.
   Resolved by the same fix as #6: release the recorded amount, never a recomputed one.
 
 - [ ] **8. Use `market.quoteAsset` instead of hardcoded `"USDC"`**
-  Same blocks. Also remove the duplicate `tx.findMarket(event.market)` call whose result is
-  assigned to `marketData` and never used.
+  Same five blocks — `persistence-service.ts:100, 134, 163, 201, 229`.
+  Separately, the `order.cancelled` block alone (`:131-132`) makes a second, redundant
+  `tx.findMarket(event.market)` call assigned to `marketData`; the local `market` already
+  holds the same row, and `marketData` is only ever read as a null guard. Remove it.
 
 - [ ] **9. Get money off floats**
-  `prisma-api-runtime.ts:695` (`decimal()` → `Number`), writes via `String(number)`.
-  `packages/risk/src/margin.ts:200` (`roundFinancial` = `toFixed(12)`) patches the symptom.
+  `prisma-api-runtime.ts:681` (`decimal()` → `Number`), writes via `String(number)`.
+  `roundFinancial` (= `toFixed(12)`) patches the symptom.
   The schema is correctly `Decimal(36,18)` and every boundary throws that away.
   `String(1e-7)` also emits exponential notation Prisma can't parse.
   Move to `Prisma.Decimal` or fixed-point integers end-to-end; delete `roundFinancial`.
   **Do this after #3-#8** — migrating while the logic is still wrong means doing it twice.
+
+  `roundFinancial` is copy-pasted into **five** files, each a private definition, so this is
+  five deletions and not one: `margin.ts:185`, `liquidation.ts:285`, `ledger.ts:84`,
+  `funding.ts:200`, `position-engine.ts:189`.
 
 - [ ] **10. Move the margin check inside the transaction**
   `prisma-api-runtime.ts:283-320`. Balance, positions, and open orders are read in three
@@ -105,7 +131,9 @@ File references are `path:line` at the time of review — verify before editing.
 - [ ] **12. Wire up the liquidation engine**
   `packages/risk/src/liquidation.ts` — `createLiquidationTriggers`, `useInsuranceFund`,
   `calculateAdlScore`, `createLiquidationOrder`, `settleLiquidationDeficit`, and
-  `isMaintenanceMarginViolated` have **zero production callers**. The system offers 20x
+  `createAdlActions`, plus `isMaintenanceMarginViolated` (which lives in
+  `packages/risk/src/margin.ts:116`, not in `liquidation.ts`), have **zero production
+  callers** — verified: no references outside `packages/risk`. The system offers 20x
   leverage with no mechanism to close underwater positions, and the insurance fund table is
   never written to. README claims Phase 5 is implemented.
   A worker that scans positions against mark price and submits liquidation orders is roughly
@@ -117,9 +145,10 @@ File references are `path:line` at the time of review — verify before editing.
   Add a scheduled worker on the `fundingIntervalHours` cadence.
 
 - [ ] **14. Convert floats to ticks/lots at the API boundary**
-  `prisma-api-runtime.ts:340-343` — `qtyLots: input.quantity`, `priceTicks: input.price` pass
+  `prisma-api-runtime.ts:345-346` — `qtyLots: input.quantity`, `priceTicks: input.price` pass
   raw floats straight from JSON into the engine's integer domain. `market.tickSize` and
-  `market.lotSize` are loaded in `mapMarket` and never used.
+  `market.lotSize` are loaded in `mapMarket` (`:606-607`) and never used for conversion
+  anywhere.
   This voids every guarantee the engine's integer design provides and makes the type names lie.
   Convert: `qtyLots = round(qty / lotSize)`, `priceTicks = round(price / tickSize)`.
   Reject non-aligned input with a 400.
@@ -131,16 +160,21 @@ File references are `path:line` at the time of review — verify before editing.
 
 - [ ] **16. Prevent matching-engine split brain**
   `production-workers.ts` holds the orderbook in process memory and reads with
-  `consumerName ?? "matching-engine-1"` — a constant default. Two replicas share a consumer
-  group, so Redis splits commands between them and each builds a different book from a
-  different subset of orders, both writing to the same Redis cache key.
+  `consumerName ?? "matching-engine-1"` (`:230`) — a constant default. Two replicas share a
+  consumer group, so Redis splits commands between them and each builds a different book from
+  a different subset of orders, both writing to the same Redis cache key.
   Add leader election (Redis lock with a fencing token) or explicit market partitioning, plus
   a startup guard that refuses to run if the lock is held.
 
+  The persistence worker has the same defect and is worse: `:362` hardcodes
+  `consumerName = "persistence-worker-1"` as a constructor default with no option to override
+  it at all.
+
 - [ ] **17. Fix or delete `cleanupPendingEntries()`**
-  `production-workers.ts:212-222` is a stub that logs `"Skipping pending entries cleanup
-  (disabled)"` and sets `pendingCleanupComplete = true`. The PEL-limit error handler calls it,
-  so the recovery path is a no-op that reports success.
+  `production-workers.ts:215-222` is a stub that logs `"Skipping pending entries cleanup
+  (disabled)"` and sets `pendingCleanupComplete = true`. Both `recover()` (`:69`) and the
+  PEL-limit error handler (`:288`) call it, so the recovery path is a no-op that reports
+  success.
   Implement with `XAUTOCLAIM` or remove it and the call site.
 
 - [ ] **18. Stop failing open on orderbook reads**
@@ -150,8 +184,9 @@ File references are `path:line` at the time of review — verify before editing.
   risk-input paths.
 
 - [ ] **19. Add graceful shutdown**
-  `setInterval` loops in `apps/api/src/index.ts:56` and `apps/workers/src/index.ts` with no
-  SIGTERM handler. Railway sends SIGTERM on every deploy, which can kill the process between
+  `setInterval` loops in `apps/api/src/index.ts:51` and `apps/workers/src/index.ts:27` with no
+  SIGTERM handler — there is no `process.on(...)` signal handler anywhere in the backend.
+  Railway sends SIGTERM on every deploy, which can kill the process between
   "engine applied the command" and "events appended to the stream", losing fills silently.
 
 ---
@@ -159,10 +194,14 @@ File references are `path:line` at the time of review — verify before editing.
 ## Tier 3 — API, security, and interface quality
 
 - [ ] **20. Fix error handling**
-  `apps/api/src/app.ts:190-194`. Every error becomes a 400 with the internal message
-  string-mangled into an error code via `toUpperCase().replaceAll(" ", "_")`.
-  A Prisma connection failure returns `400 CONNECT_ECONNREFUSED_...`; `"invalid credentials"`
-  returns 400 instead of 401; adding a period to a message is a breaking API change.
+  `apps/api/src/app.ts:196-200`. Every error except the single literal message
+  `"unauthenticated"` becomes a 400 (`:198` is `message === "unauthenticated" ? 401 : 400`),
+  with the internal message string-mangled into an error code via
+  `toUpperCase().replaceAll(" ", "_")`.
+  `"invalid credentials"` (`prisma-api-runtime.ts:107, 114`) therefore returns 400 instead of
+  401; adding a period to a message is a breaking API change. A Prisma connection failure is
+  expected to surface as a mangled 400 too, but the exact code depends on Prisma's runtime
+  error text and has not been reproduced against a live DB.
   Use typed error classes with explicit status mapping — reuse the rejection-reason union
   pattern already used in the matching engine.
 
@@ -170,7 +209,7 @@ File references are `path:line` at the time of review — verify before editing.
   `app.ts:190` — no auth check at all. Add an admin token or remove it from the production app.
 
 - [ ] **22. Harden `POST /auth/guest`**
-  `prisma-api-runtime.ts:126-147` creates a real user row and runs a password hash,
+  `prisma-api-runtime.ts:128-146` creates a real user row and runs a password hash,
   unauthenticated and unrate-limited — unbounded table growth plus deliberate CPU burn,
   trivially scripted. Rate limit by IP, sign a stateless ephemeral guest token instead of
   persisting a user, and TTL-expire guests.
@@ -185,18 +224,25 @@ File references are `path:line` at the time of review — verify before editing.
 
 - [ ] **25. Add idempotency to `POST /orders`**
   A client retry on timeout creates a duplicate order. The engine already has
-  `DUPLICATE_ORDER_ID` but can't help because the API generates the ID server-side.
-  Accept an `Idempotency-Key` / `clientOrderId`, unique-indexed per user.
+  `DUPLICATE_ORDER_ID` (`packages/matching-engine/src/orderbook.ts:226`) but can't help
+  because the API generates the ID server-side.
+
+  **The schema half is already done** — `clientOrderId String?` exists at
+  `prisma/schema.prisma:174` with `@@unique([userId, clientOrderId])` at `:193`. No migration
+  needed. What's missing is entirely in the API: accept `Idempotency-Key` / `clientOrderId`,
+  persist it, and return the existing order on a repeat.
 
 - [ ] **26. Validate order payloads with a schema**
-  `app.ts:220-240` (`normalizeOrderInput`) uses bare `Number()` coercion, so `Number("abc")`
-  → `NaN` reaches the engine. Add Zod or equivalent at the boundary.
+  `app.ts:239-254` (`normalizeOrderInput`) uses bare `Number()` coercion, so `Number("abc")`
+  → `NaN` reaches the engine. Only `riskPrice` is finite-checked
+  (`prisma-api-runtime.ts:282`); `input.quantity` is never validated on the submit path.
+  Add Zod or equivalent at the boundary.
 
 - [ ] **27. Restore type safety in the Prisma adapter**
   `prisma-api-runtime.ts:34-77` hand-rolls an interface where every method returns `unknown`,
-  read through `field()` casts at `:695`. Also `listPositions(): Promise<unknown[]>` in the
-  public `ApiRuntime` interface, and `(this.options.bus as any).trimStream` in
-  `production-workers.ts`.
+  read through `field()` casts at `:681`. Also `listPositions(): Promise<unknown[]>` in the
+  public `ApiRuntime` interface (`packages/runtime/src/api-runtime.ts:22`), and
+  `(this.options.bus as any).trimStream` in `production-workers.ts:281`.
   This means zero compile-time checking in the file that computes margin — a field typo
   silently yields `Number(undefined ?? 0) === 0`.
   Use generated Prisma types, or parse rows at the boundary so a mismatch throws.
@@ -213,7 +259,8 @@ File references are `path:line` at the time of review — verify before editing.
 ## Tier 4 — Observability and performance
 
 - [ ] **30. Replace `console.log` with a structured logger**
-  58 call sites across backend packages. Emoji logs per order (`🔒 Locked ...`) and
+  72 `console.*` call sites across backend packages (44 of them `console.log`), excluding
+  `apps/web` and tests. Emoji logs per order (`🔒 Locked ...`) and
   `[MATCHING] Reading from ...` on every 100ms poll per market — roughly 10 lines/sec/market
   of noise with no levels, no structure, no sampling. Real errors are unfindable.
   (Commit `8a8bc5f` fixing plaintext password logging has the same root cause.)
@@ -226,24 +273,35 @@ File references are `path:line` at the time of review — verify before editing.
   No counters, no histograms, no `/metrics` endpoint. There's currently no way to answer
   "how many orders failed today".
 
-- [ ] **33. Stop publishing a full orderbook snapshot every 100ms**
-  `production-workers.ts` — `publishOrderBookToCache` runs unconditionally on every poll per
-  market, serializing and writing the whole book regardless of whether anything changed.
-  This is the real scaling bottleneck, well before matching throughput.
+- [ ] **33. Stop republishing the orderbook snapshot every 100ms**
+  `production-workers.ts:298-315` — `publishOrderBookToCache` runs unconditionally on every
+  poll per market, serializing and writing a **top-20** snapshot
+  (`getBookSnapshot(market, 20)`, `:304`) regardless of whether anything changed.
+  Not the whole book, so the per-call cost is bounded — but it is still a serialize plus a
+  Redis round trip per market per 100ms with no change detection.
   Publish on change and use the sequence numbers already present in the snapshot type for
   incremental diffs.
 
 - [ ] **34. Bound the tree traversal recursion**
-  `packages/matching-engine/src/price-level-tree.ts:171-205` — `visitAscending` /
-  `visitDescending` recurse with no depth bound, and `valuesBestFirst()` with no limit is
-  called on every worker iteration.
+  `packages/matching-engine/src/price-level-tree.ts:171-205` — the private `visitAscending` /
+  `visitDescending` methods recurse with no depth bound (self-calls at `:181`, `:187`, `:199`,
+  `:205`). A degenerate treap shape means stack depth proportional to price-level count.
+  Note the matching worker is *not* an unbounded caller: it goes through
+  `getBookSnapshot(market, 20)` → `snapshot(20)` → `valuesBestFirst(20)`. The unbounded risk
+  is `valuesBestFirst()` / `snapshot()` called with no `depth` argument — both parameters are
+  optional (`price-level-tree.ts:78`, `orderbook.ts:155`).
 
 - [ ] **35. Add timeouts**
   No HTTP request timeout, no DB statement timeout, no Redis command timeout.
 
 - [ ] **36. Re-enable snapshot-based recovery in production**
-  Commit `75e509b` disabled file snapshots completely in production. The recovery system is
-  designed, implemented, and tested — and then switched off where it actually matters.
+  Commit `75e509b` ("Disable file snapshots completely in production - use Redis cache only")
+  disabled file snapshots in production. The recovery system is designed, implemented, and
+  tested — and then switched off where it actually matters.
+  `ProductionMatchingWorker` is constructed without `snapshotStore`
+  (`apps/workers/src/index.ts:93-98`), so `maybeSnapshot` returns early forever. The
+  `FileSnapshotStore` import at `apps/workers/src/index.ts:13` is now dead and type-checks
+  clean only because `noUnusedLocals` is `false`.
 
 ---
 
@@ -296,7 +354,7 @@ File references are `path:line` at the time of review — verify before editing.
   one, so a visitor can't tell which numbers are real.
 
 - [ ] **46. Clean up `any` / `@ts-ignore` in `apps/web`**
-  44 occurrences.
+  52 occurrences of `: any` / `as any` / `@ts-ignore` / `@ts-expect-error`.
 
 - [ ] **47. Add an app Dockerfile and a backup procedure**
   Deployment relies on Railway's Nixpacks autodetect; `docker-compose.yml` covers only
@@ -307,8 +365,8 @@ File references are `path:line` at the time of review — verify before editing.
 ## Suggested execution order
 
 **Week 1 — credibility floor**
-~~#1, #1b, #2~~ (done) → #6, #7, #8 (one change kills four defects) → #5 → #3, #4.
-Outcome: green CI, and money that actually moves correctly.
+~~#1, #1b, #2~~ (done) → #6, #7, #8 (one change fixes all three across the same five blocks)
+→ #5 → #3, #4. Outcome: green CI, and money that actually moves correctly.
 
 **Week 2 — close the domain gaps**
 #9 (Decimal migration — after the logic is right, not before) → #12 (liquidation worker) →
