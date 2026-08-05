@@ -58,15 +58,36 @@ describe("api app", () => {
     }));
     await app.runtime.drain();
 
-    const makerFills = await json<unknown[]>(
+    const makerFills = await json<Array<{ fee: number; realizedPnl: number }>>(
       await app.fetch(authGet("/fills", makerLogin.token)),
+    );
+    const takerFills = await json<Array<{ fee: number }>>(
+      await app.fetch(authGet("/fills", takerLogin.token)),
     );
     const takerPositions = await json<Array<{ quantity: number }>>(
       await app.fetch(authGet("/positions", takerLogin.token)),
     );
+    const makerBalances = await json<Array<{ asset: string; total: number }>>(
+      await app.fetch(authGet("/balances", makerLogin.token)),
+    );
+    const takerBalances = await json<Array<{ asset: string; total: number }>>(
+      await app.fetch(authGet("/balances", takerLogin.token)),
+    );
 
     expect(makerFills).toHaveLength(1);
     expect(takerPositions[0]?.quantity).toBe(1);
+
+    // The in-memory runtime must charge the same per-role fees as PersistenceService, or the
+    // two runtimes drift and only production is wrong. 1 @ 100 => notional 100.
+    expect(makerFills[0]?.fee).toBeCloseTo(100 * 0.0002, 10);
+    expect(takerFills[0]?.fee).toBeCloseTo(100 * 0.0005, 10);
+    expect(makerFills[0]?.realizedPnl).toBe(0);
+
+    const usdc = (balances: Array<{ asset: string; total: number }>) =>
+      balances.find((balance) => balance.asset === "USDC")?.total ?? 0;
+
+    expect(usdc(makerBalances)).toBeCloseTo(10_000 - 100 * 0.0002, 10);
+    expect(usdc(takerBalances)).toBeCloseTo(10_000 - 100 * 0.0005, 10);
   });
 
   it("exposes orderbook data", async () => {

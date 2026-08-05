@@ -80,6 +80,32 @@ export class RuntimeStore {
     return next;
   }
 
+  /**
+   * Applies a settlement delta (realized PnL, trading fee) to a balance.
+   *
+   * Unlike `adjustBalance` this permits a negative result: losses exceeding collateral are real
+   * bad debt, and refusing to record them would silently forgive the shortfall. `adjustBalance`
+   * keeps its guard for deposits and withdrawals, where a negative result means a bug.
+   */
+  settleBalance(userId: string, asset: string, amount: number): RuntimeBalance {
+    const key = balanceKey(userId, asset);
+    const current =
+      this.balances.get(key) ?? { userId, asset, total: 0, locked: 0 };
+    const next = {
+      ...current,
+      total: Number((current.total + amount).toFixed(12)),
+    };
+
+    if (next.total < 0) {
+      console.error(
+        `balance went negative for user ${userId} ${asset}: ${next.total} after ${amount}`,
+      );
+    }
+
+    this.balances.set(key, next);
+    return next;
+  }
+
   getBalance(userId: string, asset: string): RuntimeBalance {
     return this.balances.get(balanceKey(userId, asset)) ?? {
       userId,

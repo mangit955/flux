@@ -215,24 +215,35 @@ function decodeXReadGroupRows<T>(
 ): StreamMessage<T>[] {
   const result: StreamMessage<T>[] = [];
 
-  if (!Array.isArray(rows)) {
-    return result;
-  }
-
-  for (const streamRow of rows) {
-    if (!Array.isArray(streamRow)) {
-      continue;
-    }
-
-    const stream = String(streamRow[0] ?? fallbackStream);
-    const messages = streamRow[1];
-
+  // XREADGROUP is the one stream reply whose shape depends on the protocol version: RESP2
+  // returns [[stream, entries], ...] while RESP3 returns a map keyed by stream name. Bun's
+  // Redis client negotiates RESP3, so accepting only the array form silently dropped every
+  // message the consumer group had already moved into the PEL — commands were consumed and
+  // discarded, and no order could ever match. XRANGE and XAUTOCLAIM are arrays either way.
+  for (const [stream, messages] of streamEntries(fallbackStream, rows)) {
     if (Array.isArray(messages)) {
       result.push(...decodeRedisStreamRows<T>(stream, messages));
     }
   }
 
   return result;
+}
+
+function streamEntries(
+  fallbackStream: string,
+  rows: unknown,
+): Array<[string, unknown]> {
+  if (Array.isArray(rows)) {
+    return rows
+      .filter((row): row is unknown[] => Array.isArray(row))
+      .map((row) => [String(row[0] ?? fallbackStream), row[1]]);
+  }
+
+  if (rows && typeof rows === "object") {
+    return Object.entries(rows as Record<string, unknown>);
+  }
+
+  return [];
 }
 
 function decodeRedisStreamRows<T>(

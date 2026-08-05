@@ -45,6 +45,8 @@ export interface PrismaApiClient {
 }
 
 export interface PrismaApiTransaction {
+  /** Returns the number of affected rows. Available on Prisma's interactive transaction client. */
+  $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
   user: {
     create(args: { data: { email: string; passwordHash: string } }): Promise<unknown>;
     findUnique(args: { where: { id?: string; email?: string } }): Promise<unknown | null>;
@@ -357,41 +359,36 @@ export class PrismaApiRuntime implements ApiRuntime {
     };
 
     await this.options.client.$transaction(async (tx) => {
-      // Lock the required margin in the user's balance
+      // Lock the required margin in the user's balance.
+      //
+      // Check and write are one statement on purpose: reading `locked`, checking availability
+      // in JS, then writing it back leaves a window in which a concurrent order reads the same
+      // value, so both pass the check and the second write silently overwrites the first. The
+      // arithmetic also stays in Postgres `numeric` rather than round-tripping through a float.
       if (marginToLock > 0 && !input.reduceOnly) {
-        const currentBalance = await tx.balance.findUnique({
-          where: {
-            userId_asset: {
-              userId: input.userId,
-              asset: market.quoteAsset,
+        const locked = await tx.$executeRawUnsafe(
+          `UPDATE "balances"
+              SET "locked" = "locked" + $1::numeric, "updatedAt" = NOW()
+            WHERE "userId" = $2 AND "asset" = $3
+              AND "total" - "locked" >= $1::numeric`,
+          String(marginToLock),
+          input.userId,
+          market.quoteAsset,
+        );
+
+        if (locked === 0) {
+          // Zero rows means either no balance row or not enough available; only now is it worth
+          // a read to tell the two apart, since app.ts maps these messages to status codes.
+          const currentBalance = await tx.balance.findUnique({
+            where: {
+              userId_asset: { userId: input.userId, asset: market.quoteAsset },
             },
-          },
-        });
+          });
 
-        if (!currentBalance) {
-          throw new Error("balance not found");
+          throw new Error(
+            currentBalance ? "insufficient available balance" : "balance not found",
+          );
         }
-
-        const currentTotal = Number(field(currentBalance, "total"));
-        const currentLocked = Number(field(currentBalance, "locked"));
-        const available = currentTotal - currentLocked;
-
-        if (available < marginToLock) {
-          throw new Error("insufficient available balance");
-        }
-
-        // Update balance with locked amount
-        await tx.balance.update({
-          where: {
-            userId_asset: {
-              userId: input.userId,
-              asset: market.quoteAsset,
-            },
-          },
-          data: {
-            locked: String(currentLocked + marginToLock),
-          },
-        });
 
         console.log(`🔒 Locked ${marginToLock.toFixed(2)} ${market.quoteAsset} for order ${orderId}`);
       }

@@ -56,6 +56,7 @@ enum PositionSide {
 
 enum LedgerEntryType {
   DEPOSIT
+  WITHDRAW
   TRADING_FEE
   REALIZED_PNL
   FUNDING_PAYMENT
@@ -139,6 +140,8 @@ model Market {
   @@map("markets")
 }
 
+/// `balances_locked_non_negative` (CHECK "locked" >= 0) is enforced in the database but has no
+/// Prisma equivalent — see migrations/20260805010000_balance_integrity. Do not drop it as drift.
 model Balance {
   id        String   @id @default(cuid())
   userId    String

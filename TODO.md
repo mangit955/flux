@@ -39,40 +39,76 @@ verified locally are marked as such inline rather than stated as fact.
   No service containers needed — the suite runs entirely on the in-memory ports.
   This is what stops #1 and #1b from happening again.
 
+- [x] **2b. Fix `RedisStreamBus.readGroup` silently discarding every message**
+  **Production could not match a single order.** `XREADGROUP` is the one stream reply whose
+  shape depends on the protocol version: RESP2 returns `[[stream, entries], ...]`, RESP3 returns
+  a map keyed by stream name. Bun's Redis client negotiates RESP3, and `decodeXReadGroupRows`
+  began with `if (!Array.isArray(rows)) return result` — so it returned zero messages for
+  commands Redis had already delivered into the PEL. Symptom: `last-delivered-id` advances, the
+  PEL grows, `[MATCHING] Read 0 messages` forever, no errors, and no engine events; submitted
+  orders locked margin and then vanished.
+  The decoder now accepts both shapes. `XRANGE` and `XAUTOCLAIM` return arrays under both
+  protocols and were unaffected — verified against a live Redis 7.
+
+  The existing test passed throughout because it hand-fed the RESP2 array form; there is now a
+  RESP3 case alongside it. Found while running the end-to-end verification for #3/#4/#5, which
+  could not otherwise get a single fill.
+
 ---
 
 ## Tier 1 — Correctness in the money path
 
-- [ ] **3. Charge fees on fills**
-  `packages/db/src/persistence-service.ts:279` (`fee: 0`), `:342`, `:358` (`fee: "0"`).
-  Fills are written with a hardcoded zero fee **in the production path**, so the exchange
-  collects nothing while `checkOrderMargin` reserves `requiredFee` on every order.
-  Compute maker/taker fee from `market.makerFeeRate` / `takerFeeRate`, debit `balance.total`,
-  write a `LedgerEntry`.
+- [x] **3. Charge fees on fills**
+  Fees are now computed per liquidity role in `applyRoleFillToPosition`
+  (`persistence-service.ts`) — maker at `makerFeeRate`, taker at `takerFeeRate` — written to the
+  fill row, debited from `balance.total`, and recorded as a `TRADING_FEE` ledger entry, all in
+  the transaction `PersistenceService` already owns. Both runtimes now pass the real fee into
+  `applyFillToPosition`, so the position's realized PnL is net of fees in both.
 
-  **This is a dual-runtime change.** The in-memory path already charges a fee:
-  `packages/runtime/src/workers.ts:294` computes
-  `tradeValue * (makerFeeRate | takerFeeRate)` and debits it at `:302`. The two
-  implementations must end up agreeing — see the `dual-runtime` skill. Note both paths pass
-  `fee: 0` into `applyFillToPosition` (`workers.ts:278`, `persistence-service.ts:279`), so the
-  fee is currently excluded from the position's realized-PnL accounting in both.
+  The in-memory pair (`workers.ts`) was reworked to match, including its `fee: 0` placeholder on
+  the fill row. `apps/api/src/app.test.ts` asserts the in-memory numbers, which is the guard
+  against the two runtimes drifting again.
 
-- [ ] **4. Settle realized PnL into balances**
-  `persistence-service.ts:343`, `:359` (`realizedPnl: "0"` on the fill rows).
-  `applyFillToPosition` computes realized PnL correctly and it *is* persisted on the position
-  row — `next.realizedPnl` accumulates at `packages/risk/src/position-engine.ts:90-92` and is
-  written by `positionToWrite` (`persistence-service.ts:419`). What never happens is
-  **settlement into `balance.total`**, so a user can open a position, have it move in their
-  favour, close it, and receive nothing spendable.
-  Persist it on the fill *and* credit `balance.total` in the same transaction.
+  Verified against live Postgres: on a 1 @ 59.91 trade the maker paid 0.011982 (× 0.0002) and
+  the taker 0.029955 (× 0.0005), with matching `TRADING_FEE` rows.
 
-- [ ] **5. Fix the lost-update race on `balance.locked`**
-  `packages/runtime/src/prisma-api-runtime.ts:360-392` and
-  `packages/db/src/prisma-persistence-store.ts:239-273`.
-  Read-modify-write with no row lock, no atomic increment, and default READ COMMITTED
-  isolation. Two concurrent orders both read `locked`, both pass the check, second write wins.
-  Use `SELECT ... FOR UPDATE` or Prisma `{ increment }`, and add a DB
-  `CHECK (locked <= total)` constraint as a backstop.
+- [x] **4. Settle realized PnL into balances**
+  `settleRoleFill` credits the gross `realizedPnlDelta` to `balance.total` and writes a
+  `REALIZED_PNL` ledger entry; the fill row carries the delta instead of `"0"`. No double
+  counting: the balance receives gross PnL minus fee, and the position row records the same net
+  figure via `applyFillToPosition`.
+
+  A loss exceeding collateral now drives the balance negative and logs, rather than being
+  clamped away (which silently forgives the shortfall) or thrown (which the persistence worker
+  would swallow, dropping the fill — see #11). Bad debt is #12's to resolve.
+
+  Verified against live Postgres: closing a long from 59.91 to 99.23 moved the balance
+  9999.970045 → 10039.240430 (+39.32 gross, −0.049615 fee), left the position FLAT with
+  `realizedPnl` 39.240430 net of both fees, and the counterparty took the exact mirror.
+
+- [x] **5. Fix the lost-update race on `balance.locked`**
+  The lock is a single conditional statement — `UPDATE ... SET locked = locked + $1 WHERE total
+  - locked >= $1` — so check and write cannot be separated by a concurrent transaction; rowcount
+  0 means insufficient funds. The unlock side uses a `FOR UPDATE` CTE that still returns the
+  previous value, keeping the over-release check. Both keep the arithmetic in Postgres `numeric`
+  instead of round-tripping through a float, which is a step toward #9.
+
+  The DB backstop is `CHECK ("locked" >= 0)`, **not** `CHECK (locked <= total)`. The latter
+  aborts legitimate settlement: total 1000, `locked` 900 for other open orders, a realized loss
+  of 200 → total 800 < locked 900 → the transaction rolls back and the worker drops the fill.
+  It would also forbid the negative totals that record bad debt. `locked` only ever increases in
+  the conditional lock statement above, which enforces `locked <= total` structurally.
+
+  Verified against live Postgres: 20 concurrent submissions against a 10 USDC balance produced
+  exactly 9 accepted and 11 `INSUFFICIENT_AVAILABLE_BALANCE`, with `locked` 9.045 — exactly the
+  sum of the 9 orders' recorded `lockedMargin`. Neither raw statement is reachable from
+  `bun test`, which runs on the in-memory store; #38 is the automated version of that check.
+
+- [x] **5b. Add the missing `WITHDRAW` ledger enum value**
+  `LedgerEntryType` had no `WITHDRAW` member, but `prisma-api-runtime.ts` writes
+  `type: "WITHDRAW"` — so against a real Postgres every withdrawal failed at the ledger insert
+  and rolled the whole transaction back. Added in the same migration; a live withdrawal now
+  succeeds and writes its ledger row. Found while verifying #3/#4.
 
 - [x] **6. Stop hardcoding `leverage = 10` in the unlock path**
   Fixed together with #7 and #8, since all three lived in the same five blocks. `orders` now
@@ -104,6 +140,15 @@ verified locally are marked as such inline rather than stated as fact.
   reconstruction before being kept. `InMemoryPersistenceStore` now tracks balances for real
   (it previously stubbed the unlock with a `console.log`), so the `locked <= total` invariant is
   actually asserted. `PrismaApiRuntime`'s lock-write half remains untested — see #37.
+
+- [ ] **8b. Stop reserving the taker fee on orders that can only be makers**
+  `estimatedFeeForOpenOrder` (`packages/risk/src/margin.ts:143`) uses `order.estimatedFeeRate`,
+  and both submit paths pass `market.takerFeeRate` unconditionally
+  (`prisma-api-runtime.ts:309, 319`; `exchange-runtime.ts:147`). A post-only order can never be
+  a taker, so it over-reserves margin — at the seeded rates, 2.5x the fee it will actually pay.
+  Harmless to correctness now that the release returns the recorded amount (#6), but it is
+  collateral held for no reason on exactly the orders that provide liquidity.
+  Found while implementing #3.
 
 - [ ] **9. Get money off floats**
   `prisma-api-runtime.ts:681` (`decimal()` → `Number`), writes via `String(number)`.
@@ -370,9 +415,10 @@ verified locally are marked as such inline rather than stated as fact.
 
 ## Suggested execution order
 
-**Week 1 — credibility floor**
-~~#1, #1b, #2~~ → ~~#6, #7, #8~~ (done — one change fixed all three across the same five blocks)
-→ #5 → #3, #4. Outcome: green CI, and money that actually moves correctly.
+**Week 1 — credibility floor** — done.
+~~#1, #1b, #2~~ → ~~#6, #7, #8~~ (one change fixed all three across the same five blocks)
+→ ~~#5~~ → ~~#3, #4~~. Outcome: green CI, and money that actually moves correctly.
+Tier 1 now has #9, #10, #11 and the newly found #8b left.
 
 **Week 2 — close the domain gaps**
 #9 (Decimal migration — after the logic is right, not before) → #12 (liquidation worker) →

@@ -21,6 +21,33 @@ describe("RedisStreamBus", () => {
     ]);
   });
 
+  it("reads consumer-group messages from a RESP3 map reply", async () => {
+    // Bun's Redis client negotiates RESP3, where XREADGROUP replies with a map keyed by stream
+    // name rather than the RESP2 array below. Decoding only the array form silently returned
+    // zero messages for commands Redis had already moved into the PEL, so the matching worker
+    // consumed and discarded every order.
+    const redis = new FakeRedis({
+      XREADGROUP: {
+        "engine.commands.BTC-PERP": [["3-0", ["payload", "{\"ok\":true}"]]],
+      },
+    });
+    const bus = new RedisStreamBus({ redis });
+
+    const messages = await bus.readGroup<{ ok: boolean }>(
+      "engine.commands.BTC-PERP",
+      "matching-engine",
+      "consumer-1",
+    );
+
+    expect(messages).toEqual([
+      {
+        id: "3-0",
+        stream: "engine.commands.BTC-PERP",
+        payload: { ok: true },
+      },
+    ]);
+  });
+
   it("reads consumer-group messages and acks them", async () => {
     const redis = new FakeRedis({
       XREADGROUP: [["engine.events.BTC-PERP", [["2-0", ["payload", "{\"ok\":true}"]]]]],

@@ -92,13 +92,15 @@ describe("PersistenceService", () => {
     expect(first).toMatchObject({
       status: "processed",
       writes: [
+        "positions.upsert_maker_after_trade",
+        "positions.upsert_taker_after_trade",
         "fills.create_many",
         "orders.update_maker_after_trade",
         "orders.update_taker_after_trade",
         "balance.unlock_maker",
         "balance.unlock_taker",
-        "positions.upsert_maker_after_trade",
-        "positions.upsert_taker_after_trade",
+        "balance.settle_maker",
+        "balance.settle_taker",
         "processed_events.create",
       ],
     });
@@ -366,6 +368,127 @@ describe("PersistenceService margin release", () => {
   });
 });
 
+describe("PersistenceService fee and PnL settlement", () => {
+  // The seeded BTC-PERP market: makerFeeRate 0.0002, takerFeeRate 0.0005, quote asset USDC.
+  // A 5 @ 100 trade is notional 500, so maker fee 0.1 and taker fee 0.25.
+  const MAKER_FEE = 0.1;
+  const TAKER_FEE = 0.25;
+
+  it("charges the maker rate to the maker and the taker rate to the taker", async () => {
+    // TODO #3: production charged nothing at all, and `estimatedFeeForOpenOrder` reserves at the
+    // taker rate for both, so charging both at the taker rate would also be wrong.
+    const store = tradingStore();
+    const service = new PersistenceService(store);
+
+    await service.persistEvent(tradeExecutedEvent());
+
+    expect(store.getBalance("maker", "USDC")?.total).toBeCloseTo(1_000 - MAKER_FEE, 10);
+    expect(store.getBalance("taker", "USDC")?.total).toBeCloseTo(1_000 - TAKER_FEE, 10);
+  });
+
+  it("records the fee on the fill row instead of a hardcoded zero", async () => {
+    const store = tradingStore();
+    const service = new PersistenceService(store);
+
+    await service.persistEvent(tradeExecutedEvent());
+
+    expect(store.state.fills.get("trade-1:maker")).toMatchObject({
+      fee: String(MAKER_FEE),
+      realizedPnl: "0",
+    });
+    expect(store.state.fills.get("trade-1:taker")).toMatchObject({
+      fee: String(TAKER_FEE),
+      realizedPnl: "0",
+    });
+  });
+
+  it("writes a TRADING_FEE ledger entry per side", async () => {
+    const store = tradingStore();
+    const service = new PersistenceService(store);
+
+    await service.persistEvent(tradeExecutedEvent());
+
+    expect(store.state.ledgerEntries.get("trade-1:maker:fee")).toMatchObject({
+      userId: "maker",
+      asset: "USDC",
+      type: "TRADING_FEE",
+      amount: String(-MAKER_FEE),
+      balanceAfter: String(1_000 - MAKER_FEE),
+      referenceId: "trade-1:maker",
+    });
+    expect(store.state.ledgerEntries.get("trade-1:taker:fee")).toMatchObject({
+      type: "TRADING_FEE",
+      amount: String(-TAKER_FEE),
+    });
+  });
+
+  it("credits realized PnL into the balance when a position is closed", async () => {
+    // TODO #4: the PnL reached the position row but never became spendable.
+    const store = tradingStore();
+    const service = new PersistenceService(store);
+
+    // Open: taker buys 5 @ 100.
+    await service.persistEvent(tradeExecutedEvent());
+    // Close: taker sells 5 @ 120, realizing +100 gross.
+    await service.persistEvent(closingTradeEvent(120));
+
+    const closingFee = 120 * 5 * 0.0005;
+    const expected = 1_000 - TAKER_FEE + 100 - closingFee;
+
+    expect(store.getBalance("taker", "USDC")?.total).toBeCloseTo(expected, 10);
+    expect(store.state.fills.get("trade-2:taker")).toMatchObject({ realizedPnl: "100" });
+    expect(store.state.ledgerEntries.get("trade-2:taker:pnl")).toMatchObject({
+      type: "REALIZED_PNL",
+      amount: "100",
+      referenceId: "trade-2:taker",
+    });
+    // The position keeps PnL net of every fee it paid.
+    expect(store.state.positions.get("taker:BTC-PERP")).toMatchObject({
+      quantity: "0",
+      realizedPnl: String(100 - TAKER_FEE - closingFee),
+    });
+  });
+
+  it("records bad debt rather than clamping or throwing when a loss exceeds collateral", async () => {
+    const store = tradingStore({ takerTotal: 50 });
+    const service = new PersistenceService(store);
+
+    await service.persistEvent(tradeExecutedEvent());
+    // Price collapses to 20: the taker's long loses 400 on a 50 balance.
+    await service.persistEvent(closingTradeEvent(20));
+
+    const total = store.getBalance("taker", "USDC")?.total ?? 0;
+
+    expect(total).toBeLessThan(0);
+    expect(total).toBeCloseTo(50 - TAKER_FEE - 400 - 20 * 5 * 0.0005, 10);
+  });
+
+  it("never drives locked negative across a lock, partial fill, and close", async () => {
+    const store = tradingStore();
+    store.seedBalance({ userId: "taker", asset: "USDC", total: 1_000, locked: 100 });
+    store.seedOrder(
+      pendingOrder({
+        id: "bid-1",
+        userId: "taker",
+        side: "BUY",
+        quantity: "5",
+        remainingQuantity: "5",
+        lockedMargin: "100",
+      }),
+    );
+    const service = new PersistenceService(store);
+
+    await service.persistEvent({ ...tradeExecutedEvent(), takerOrderRemainingQtyLots: 2 });
+    expect(store.getBalance("taker", "USDC")!.locked).toBeGreaterThanOrEqual(0);
+
+    await service.persistEvent(orderExpiredEvent("bid-1", 2, "IOC_UNFILLED"));
+
+    const balance = store.getBalance("taker", "USDC")!;
+    expect(balance.locked).toBeGreaterThanOrEqual(0);
+    expect(balance.locked).toBe(0);
+  });
+});
+
 describe("outbox helper", () => {
   it("creates pending outbox events with stable audit fields", () => {
     const now = new Date(NOW);
@@ -409,6 +532,41 @@ function storeWithBalance(input: {
     total: input.total ?? 1_000,
     locked: input.locked,
   });
+
+  return store;
+}
+
+/** A store with both sides of `tradeExecutedEvent()` funded and their orders seeded. */
+function tradingStore(
+  options: { takerTotal?: number } = {},
+): InMemoryPersistenceStore {
+  const store = new InMemoryPersistenceStore();
+
+  store.seedBalance({ userId: "maker", asset: "USDC", total: 1_000, locked: 0 });
+  store.seedBalance({
+    userId: "taker",
+    asset: "USDC",
+    total: options.takerTotal ?? 1_000,
+    locked: 0,
+  });
+  store.seedOrder(
+    pendingOrder({
+      id: "ask-1",
+      userId: "maker",
+      side: "SELL",
+      quantity: "5",
+      remainingQuantity: "5",
+    }),
+  );
+  store.seedOrder(
+    pendingOrder({
+      id: "bid-1",
+      userId: "taker",
+      side: "BUY",
+      quantity: "5",
+      remainingQuantity: "5",
+    }),
+  );
 
   return store;
 }
@@ -457,6 +615,21 @@ function tradeExecutedEvent(): TradeExecuted {
     qtyLots: 5,
     makerOrderRemainingQtyLots: 0,
     takerOrderRemainingQtyLots: 0,
+  };
+}
+
+/** The taker closes its long at `price`, with the roles reversed on a fresh trade id. */
+function closingTradeEvent(price: number): TradeExecuted {
+  return {
+    ...tradeExecutedEvent(),
+    eventId: "event-trade-2",
+    tradeId: "trade-2",
+    sequence: 11,
+    makerOrderId: "ask-2",
+    takerOrderId: "bid-2",
+    makerSide: "buy",
+    takerSide: "sell",
+    priceTicks: price,
   };
 }
 
