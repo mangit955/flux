@@ -185,6 +185,187 @@ describe("PersistenceService", () => {
   });
 });
 
+describe("PersistenceService margin release", () => {
+  it("releases the recorded margin for a market order, whose price is null", async () => {
+    // TODO #7: the old code recomputed the release from `order.price`, which is null for every
+    // market order, so `Number(null || 0)` made every one of these leak its whole reserve.
+    const store = storeWithBalance({ locked: 150 });
+    const service = new PersistenceService(store);
+
+    store.seedOrder(
+      pendingOrder({
+        id: "order-market",
+        type: "MARKET",
+        price: null,
+        quantity: "5",
+        remainingQuantity: "5",
+        lockedMargin: "150",
+      }),
+    );
+
+    await service.persistEvent(
+      orderExpiredEvent("order-market", 5, "MARKET_LIQUIDITY_EXHAUSTED"),
+    );
+
+    expect(store.getBalance("user-1", "USDC")).toMatchObject({ locked: 0, total: 1_000 });
+    expect(store.state.orders.get("order-market")).toMatchObject({
+      status: "EXPIRED",
+      lockedMargin: "0",
+    });
+  });
+
+  it("releases exactly what a 20x order locked, not a leverage-10 reconstruction", async () => {
+    // TODO #6: the old code hardcoded `leverage = 10`, so a 20x order was refunded 2x its lock.
+    // The 200 of padding represents other orders' reserves — without it, over-release is hidden
+    // by the `Math.max(0, ...)` clamp in the store.
+    const store = storeWithBalance({ locked: 250 });
+    const service = new PersistenceService(store);
+
+    store.seedOrder(
+      pendingOrder({
+        id: "order-2",
+        price: "1000",
+        quantity: "1",
+        remainingQuantity: "1",
+        leverage: 20,
+        lockedMargin: "50",
+      }),
+    );
+
+    await service.persistEvent(orderCancelledEvent("order-2", 1));
+
+    expect(store.getBalance("user-1", "USDC")).toMatchObject({ locked: 200 });
+  });
+
+  it("releases against the market's quote asset, not a hardcoded USDC", async () => {
+    // TODO #8.
+    const store = storeWithBalance({ asset: "USDT", locked: 40 });
+    store.seedBalance({ userId: "user-1", asset: "USDC", total: 1_000, locked: 40 });
+    store.seedMarket({
+      marketId: MARKET,
+      quoteAsset: "USDT",
+      tickSize: "0.1",
+      lotSize: "0.001",
+      maxLeverage: 20,
+      initialMarginRate: "0.05",
+      maintenanceMarginRate: "0.005",
+      makerFeeRate: "0.0002",
+      takerFeeRate: "0.0005",
+    });
+    const service = new PersistenceService(store);
+
+    store.seedOrder(pendingOrder({ id: "order-3", lockedMargin: "40" }));
+
+    await service.persistEvent(orderCancelledEvent("order-3", 1));
+
+    expect(store.getBalance("user-1", "USDT")).toMatchObject({ locked: 0 });
+    expect(store.getBalance("user-1", "USDC")).toMatchObject({ locked: 40 });
+  });
+
+  it("releases a partially filled order's full reserve once, on the terminal event", async () => {
+    const store = storeWithBalance({ locked: 100 });
+    const service = new PersistenceService(store);
+    const trade = tradeExecutedEvent();
+
+    store.seedOrder(
+      pendingOrder({
+        id: trade.takerOrderId,
+        userId: "taker",
+        side: "BUY",
+        price: "100",
+        quantity: "10",
+        remainingQuantity: "10",
+        lockedMargin: "100",
+      }),
+    );
+    store.seedOrder(
+      pendingOrder({
+        id: trade.makerOrderId,
+        userId: "maker",
+        side: "SELL",
+        price: "100",
+        quantity: "5",
+        remainingQuantity: "5",
+      }),
+    );
+    // 300 = this order's 100 reserve plus 200 held by other orders, so an over- or
+    // under-release is visible rather than clamped at zero.
+    store.seedBalance({ userId: "taker", asset: "USDC", total: 1_000, locked: 300 });
+
+    // Partial fill leaves the taker PARTIALLY_FILLED, so nothing is released yet.
+    await service.persistEvent({ ...trade, takerOrderRemainingQtyLots: 5 });
+    expect(store.getBalance("taker", "USDC")).toMatchObject({ locked: 300 });
+
+    // The engine then expires the unfilled remainder of an IOC/market taker.
+    await service.persistEvent(orderExpiredEvent(trade.takerOrderId, 5, "IOC_UNFILLED"));
+    expect(store.getBalance("taker", "USDC")).toMatchObject({ locked: 200 });
+
+    // A second terminal event for the same order must not release again.
+    await service.persistEvent({
+      ...orderCancelledEvent(trade.takerOrderId, 0),
+      eventId: "event-cancelled-dup",
+    });
+    expect(store.getBalance("taker", "USDC")).toMatchObject({ locked: 200 });
+  });
+
+  it("keeps locked <= total across mixed-leverage lock/release cycles", async () => {
+    const store = storeWithBalance({ locked: 0 });
+    const service = new PersistenceService(store);
+    const orders = [
+      { id: "cycle-1", leverage: 5, lockedMargin: "200", price: "1000" as string | null },
+      { id: "cycle-2", leverage: 10, lockedMargin: "100", price: "1000" as string | null },
+      { id: "cycle-3", leverage: 20, lockedMargin: "50", price: null as string | null },
+    ];
+    const total = store.getBalance("user-1", "USDC")?.total ?? 0;
+    let locked = 0;
+
+    for (const [index, spec] of orders.entries()) {
+      // Lock, the way submitOrder does.
+      locked += Number(spec.lockedMargin);
+      store.seedBalance({ userId: "user-1", asset: "USDC", total, locked });
+      store.seedOrder(
+        pendingOrder({
+          id: spec.id,
+          type: spec.price == null ? "MARKET" : "LIMIT",
+          price: spec.price,
+          leverage: spec.leverage,
+          lockedMargin: spec.lockedMargin,
+        }),
+      );
+
+      expect(store.getBalance("user-1", "USDC")!.locked).toBeLessThanOrEqual(total);
+
+      await service.persistEvent({
+        ...orderCancelledEvent(spec.id, 1),
+        eventId: `event-cycle-${index}`,
+      });
+
+      locked = store.getBalance("user-1", "USDC")!.locked;
+      expect(locked).toBeLessThanOrEqual(total);
+    }
+
+    expect(locked).toBe(0);
+  });
+
+  it("opens the position at the order's leverage rather than a hardcoded 10", async () => {
+    const store = storeWithBalance({ locked: 0 });
+    const service = new PersistenceService(store);
+    const trade = tradeExecutedEvent();
+
+    store.seedOrder(
+      pendingOrder({ id: trade.makerOrderId, userId: "maker", side: "SELL", quantity: "5", remainingQuantity: "5", leverage: 20 }),
+    );
+    store.seedOrder(
+      pendingOrder({ id: trade.takerOrderId, userId: "taker", side: "BUY", quantity: "5", remainingQuantity: "5", leverage: 5 }),
+    );
+
+    await service.persistEvent(trade);
+
+    expect(store.state.positions.get("maker:BTC-PERP")).toMatchObject({ leverage: 20 });
+    expect(store.state.positions.get("taker:BTC-PERP")).toMatchObject({ leverage: 5 });
+  });
+});
+
 describe("outbox helper", () => {
   it("creates pending outbox events with stable audit fields", () => {
     const now = new Date(NOW);
@@ -214,6 +395,24 @@ describe("outbox helper", () => {
   });
 });
 
+function storeWithBalance(input: {
+  userId?: string;
+  asset?: string;
+  total?: number;
+  locked: number;
+}): InMemoryPersistenceStore {
+  const store = new InMemoryPersistenceStore();
+
+  store.seedBalance({
+    userId: input.userId ?? "user-1",
+    asset: input.asset ?? "USDC",
+    total: input.total ?? 1_000,
+    locked: input.locked,
+  });
+
+  return store;
+}
+
 function pendingOrder(overrides: Partial<OrderWrite>): OrderWrite {
   const now = new Date(NOW);
 
@@ -224,9 +423,12 @@ function pendingOrder(overrides: Partial<OrderWrite>): OrderWrite {
     side: overrides.side ?? "BUY",
     type: overrides.type ?? "LIMIT",
     timeInForce: overrides.timeInForce ?? "GTC",
-    price: overrides.price ?? "100",
+    // `?? "100"` would swallow an explicit null, which is exactly the market-order case here.
+    price: overrides.price === undefined ? "100" : overrides.price,
     quantity: overrides.quantity ?? "1",
     remainingQuantity: overrides.remainingQuantity ?? "1",
+    lockedMargin: overrides.lockedMargin,
+    leverage: overrides.leverage,
     reduceOnly: overrides.reduceOnly ?? false,
     postOnly: overrides.postOnly ?? false,
     status: overrides.status ?? "PENDING",
@@ -271,15 +473,36 @@ function orderRejectedEvent(): EngineEvent {
   };
 }
 
-function orderCancelledEvent(): EngineEvent {
+function orderCancelledEvent(
+  orderId = "order-2",
+  remainingQtyLots = 3,
+): EngineEvent {
   return {
-    eventId: "event-cancelled-1",
-    commandId: "cmd-order-2",
+    eventId: `event-cancelled-${orderId}`,
+    commandId: `cmd-${orderId}`,
     market: MARKET,
     sequence: 2,
     timestamp: NOW,
     type: "order.cancelled",
-    orderId: "order-2",
-    remainingQtyLots: 3,
+    orderId,
+    remainingQtyLots,
+  };
+}
+
+function orderExpiredEvent(
+  orderId: string,
+  remainingQtyLots: number,
+  reason: "MARKET_LIQUIDITY_EXHAUSTED" | "IOC_UNFILLED",
+): EngineEvent {
+  return {
+    eventId: `event-expired-${orderId}`,
+    commandId: `cmd-${orderId}`,
+    market: MARKET,
+    sequence: 3,
+    timestamp: NOW,
+    type: "order.expired",
+    orderId,
+    remainingQtyLots,
+    reason,
   };
 }

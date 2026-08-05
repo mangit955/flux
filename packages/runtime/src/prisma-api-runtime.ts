@@ -21,6 +21,9 @@ import type { OrderBookCache } from "./orderbook-cache";
 import type { PriceCache } from "./price-cache";
 import { estimateMarketOrderRiskPrice, type MarketOrderRiskPrice } from "./market-order-risk";
 
+/** Leverage assumed when the caller does not specify one. */
+const DEFAULT_LEVERAGE = 10;
+
 export interface PrismaApiRuntimeOptions {
   client: PrismaApiClient;
   jwtSecret: string;
@@ -307,7 +310,7 @@ export class PrismaApiRuntime implements ApiRuntime {
           quantity: decimal(order, "remainingQuantity"),
           reduceOnly: Boolean(field(order, "reduceOnly")),
           estimatedFeeRate: market.takerFeeRate,
-          leverage: input.leverage ?? 10,
+          leverage: input.leverage ?? DEFAULT_LEVERAGE,
         })),
       },
       {
@@ -317,7 +320,7 @@ export class PrismaApiRuntime implements ApiRuntime {
         quantity: input.quantity,
         reduceOnly: input.reduceOnly ?? false,
         estimatedFeeRate: market.takerFeeRate,
-        leverage: input.leverage ?? 10,
+        leverage: input.leverage ?? DEFAULT_LEVERAGE,
       },
       [market],
       [{ marketId: input.marketId, price: riskPrice }],
@@ -404,6 +407,9 @@ export class PrismaApiRuntime implements ApiRuntime {
           price: order.price == null ? null : String(order.price),
           quantity: String(order.quantity),
           remainingQuantity: String(order.remainingQuantity),
+          // Record what was actually locked so the release path never has to reconstruct it.
+          lockedMargin: String(input.reduceOnly ? 0 : marginToLock),
+          leverage: order.leverage,
           reduceOnly: order.reduceOnly,
           postOnly: order.postOnly,
           status: order.status,
@@ -589,6 +595,7 @@ function runtimeOrderFromInput(
     remainingQuantity: input.quantity,
     price: input.price,
     timeInForce: input.timeInForce,
+    leverage: input.leverage ?? DEFAULT_LEVERAGE,
     reduceOnly: input.reduceOnly ?? false,
     postOnly: input.postOnly ?? false,
     status: "PENDING",
@@ -647,6 +654,7 @@ function mapOrder(row: unknown): RuntimeOrder {
     remainingQuantity: decimal(row, "remainingQuantity"),
     price: nullableDecimal(row, "price"),
     timeInForce: field(row, "timeInForce") as RuntimeOrder["timeInForce"],
+    leverage: Number(field(row, "leverage") ?? DEFAULT_LEVERAGE),
     reduceOnly: Boolean(field(row, "reduceOnly")),
     postOnly: Boolean(field(row, "postOnly")),
     status: field(row, "status") as RuntimeOrder["status"],

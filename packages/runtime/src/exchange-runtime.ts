@@ -6,6 +6,9 @@ import type { RuntimeCommand, RuntimeOrder } from "./types";
 import { MatchingWorker, RuntimePersistenceWorker } from "./workers";
 import { estimateMarketOrderRiskPrice, type MarketOrderRiskPrice } from "./market-order-risk";
 
+/** Leverage assumed when the caller does not specify one. */
+const DEFAULT_LEVERAGE = 10;
+
 export interface SubmitOrderInput {
   userId: string;
   marketId: string;
@@ -117,6 +120,7 @@ export class ExchangeRuntime {
       remainingQuantity: input.quantity,
       price: input.price,
       timeInForce: input.timeInForce,
+      leverage: input.leverage ?? DEFAULT_LEVERAGE,
       reduceOnly: input.reduceOnly ?? false,
       postOnly: input.postOnly ?? false,
       status: "PENDING",
@@ -141,7 +145,7 @@ export class ExchangeRuntime {
         quantity: input.quantity,
         reduceOnly: input.reduceOnly ?? false,
         estimatedFeeRate: market.takerFeeRate,
-        leverage: input.leverage ?? 10,
+        leverage: input.leverage ?? DEFAULT_LEVERAGE,
       },
       [market],
       [{ marketId: input.marketId, price: riskPrice }],

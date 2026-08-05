@@ -24,4 +24,5 @@ export interface PersistenceTransaction {
   upsertPosition(position: PositionWrite): Promise<void>;
   findOrder(orderId: string): Promise<OrderWrite | null>;
   unlockBalanceForOrder(userId: string, asset: string, amount: number): Promise<void>;
+  clearOrderLockedMargin(orderId: string, updatedAt: Date): Promise<void>;
 }

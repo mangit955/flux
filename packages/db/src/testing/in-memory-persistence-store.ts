@@ -11,12 +11,20 @@ import type {
   PersistenceTransaction,
 } from "../persistence-store";
 
+export interface InMemoryBalance {
+  userId: string;
+  asset: string;
+  total: number;
+  locked: number;
+}
+
 export interface InMemoryPersistenceState {
   orders: Map<string, OrderWrite>;
   fills: Map<string, FillWrite>;
   processedEvents: Map<string, ProcessedEventWrite>;
   markets: Map<string, MarketWrite>;
   positions: Map<string, PositionWrite>;
+  balances: Map<string, InMemoryBalance>;
 }
 
 export class InMemoryPersistenceStore implements PersistenceStore {
@@ -29,6 +37,7 @@ export class InMemoryPersistenceStore implements PersistenceStore {
         "BTC-PERP",
         {
           marketId: "BTC-PERP",
+          quoteAsset: "USDC",
           tickSize: "0.1",
           lotSize: "0.001",
           maxLeverage: 20,
@@ -40,6 +49,7 @@ export class InMemoryPersistenceStore implements PersistenceStore {
       ],
     ]),
     positions: new Map(),
+    balances: new Map(),
   };
 
   async transaction<T>(
@@ -53,6 +63,7 @@ export class InMemoryPersistenceStore implements PersistenceStore {
     this.state.processedEvents = draft.processedEvents;
     this.state.markets = draft.markets;
     this.state.positions = draft.positions;
+    this.state.balances = draft.balances;
 
     return result;
   }
@@ -63,6 +74,17 @@ export class InMemoryPersistenceStore implements PersistenceStore {
 
   seedMarket(market: MarketWrite): void {
     this.state.markets.set(market.marketId, { ...market });
+  }
+
+  seedBalance(balance: InMemoryBalance): void {
+    this.state.balances.set(balanceKey(balance.userId, balance.asset), {
+      ...balance,
+    });
+  }
+
+  getBalance(userId: string, asset: string): InMemoryBalance | undefined {
+    const balance = this.state.balances.get(balanceKey(userId, asset));
+    return balance ? { ...balance } : undefined;
   }
 }
 
@@ -141,8 +163,40 @@ class InMemoryPersistenceTransaction implements PersistenceTransaction {
   }
 
   async unlockBalanceForOrder(userId: string, asset: string, amount: number): Promise<void> {
-    // In-memory implementation - balances not tracked in this store
-    console.log(`🔓 [In-Memory] Unlocked ${amount.toFixed(2)} ${asset} for user ${userId}`);
+    if (amount <= 0) {
+      return;
+    }
+
+    const balance = this.state.balances.get(balanceKey(userId, asset));
+
+    if (!balance) {
+      return;
+    }
+
+    if (amount > balance.locked) {
+      console.error(
+        `margin release exceeds locked balance for user ${userId} ${asset}: releasing ${amount}, locked ${balance.locked}`,
+      );
+    }
+
+    this.state.balances.set(balanceKey(userId, asset), {
+      ...balance,
+      locked: Math.max(0, balance.locked - amount),
+    });
+  }
+
+  async clearOrderLockedMargin(orderId: string, updatedAt: Date): Promise<void> {
+    const existing = this.state.orders.get(orderId);
+
+    if (!existing) {
+      return;
+    }
+
+    this.state.orders.set(orderId, {
+      ...existing,
+      lockedMargin: "0",
+      updatedAt: new Date(updatedAt),
+    });
   }
 }
 
@@ -168,6 +222,9 @@ function cloneState(state: InMemoryPersistenceState): InMemoryPersistenceState {
         id,
         clonePosition(position),
       ]),
+    ),
+    balances: new Map(
+      [...state.balances.entries()].map(([id, balance]) => [id, { ...balance }]),
     ),
   };
 }
@@ -203,4 +260,8 @@ function clonePosition(position: PositionWrite): PositionWrite {
 
 function positionKey(userId: string, marketId: string): string {
   return `${userId}:${marketId}`;
+}
+
+function balanceKey(userId: string, asset: string): string {
+  return `${userId}:${asset}`;
 }

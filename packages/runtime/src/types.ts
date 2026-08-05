@@ -25,6 +25,7 @@ export interface RuntimeOrder {
   remainingQuantity: number;
   price?: number;
   timeInForce: "GTC" | "IOC";
+  leverage: number;
   reduceOnly: boolean;
   postOnly: boolean;
   status:

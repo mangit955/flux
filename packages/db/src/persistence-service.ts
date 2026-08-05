@@ -24,6 +24,9 @@ import type {
   PersistenceTransaction,
 } from "./persistence-store";
 
+/** Fallback for order rows written before `orders.leverage` existed. */
+const DEFAULT_LEVERAGE = 10;
+
 export interface PersistEventMetadata {
   stream?: string;
   streamId?: string;
@@ -84,23 +87,13 @@ export class PersistenceService {
         return ["orders.mark_open"];
 
       case "order.rejected":
-        // Unlock margin when order is rejected
-        const rejectedOrder = await tx.findOrder(event.orderId);
-        if (rejectedOrder && !rejectedOrder.reduceOnly) {
-          const market = await tx.findMarket(event.market);
-          if (market) {
-            const leverage = 10;
-            const price = Number(rejectedOrder.price || 0);
-            const quantity = Number(rejectedOrder.quantity);
-            const notional = price * quantity;
-            const marginLocked = notional / leverage;
-            const feeEstimate = notional * Number(market.takerFeeRate);
-            const totalToUnlock = marginLocked + feeEstimate;
-            
-            await tx.unlockBalanceForOrder(rejectedOrder.userId, "USDC", totalToUnlock);
-          }
-        }
-        
+        await releaseOrderMargin(
+          tx,
+          await tx.findOrder(event.orderId),
+          event.market,
+          new Date(event.timestamp),
+        );
+
         await tx.updateOrderStatus({
           orderId: event.orderId,
           status: "REJECTED",
@@ -114,28 +107,13 @@ export class PersistenceService {
         return ["orders.upsert_rested"];
 
       case "order.cancelled":
-        // Unlock margin when order is cancelled
-        const cancelledOrder = await tx.findOrder(event.orderId);
-        if (cancelledOrder && !cancelledOrder.reduceOnly && event.remainingQtyLots > 0) {
-          const market = await tx.findMarket(event.market);
-          if (market) {
-            // Calculate locked margin to release (proportional to remaining quantity)
-            const leverage = 10; // Default leverage, should ideally be stored with order
-            const price = Number(cancelledOrder.price || 0);
-            const remainingNotional = price * event.remainingQtyLots;
-            const marginToUnlock = remainingNotional / leverage;
-            const feeEstimate = remainingNotional * Number(market.takerFeeRate);
-            const totalToUnlock = marginToUnlock + feeEstimate;
+        await releaseOrderMargin(
+          tx,
+          await tx.findOrder(event.orderId),
+          event.market,
+          new Date(event.timestamp),
+        );
 
-            // Get quote asset from market
-            const marketData = await tx.findMarket(event.market);
-            if (marketData) {
-              // Extract quote asset - assuming format like "BTC-PERP" uses USDC
-              await tx.unlockBalanceForOrder(cancelledOrder.userId, "USDC", totalToUnlock);
-            }
-          }
-        }
-        
         await tx.updateOrderStatus({
           orderId: event.orderId,
           status: "CANCELLED",
@@ -148,22 +126,13 @@ export class PersistenceService {
         return ["orders.cancel_rejected_noop"];
 
       case "order.expired":
-        // Unlock margin when order expires
-        const expiredOrder = await tx.findOrder(event.orderId);
-        if (expiredOrder && !expiredOrder.reduceOnly && event.remainingQtyLots > 0) {
-          const market = await tx.findMarket(event.market);
-          if (market) {
-            const leverage = 10;
-            const price = Number(expiredOrder.price || 0);
-            const remainingNotional = price * event.remainingQtyLots;
-            const marginToUnlock = remainingNotional / leverage;
-            const feeEstimate = remainingNotional * Number(market.takerFeeRate);
-            const totalToUnlock = marginToUnlock + feeEstimate;
-            
-            await tx.unlockBalanceForOrder(expiredOrder.userId, "USDC", totalToUnlock);
-          }
-        }
-        
+        await releaseOrderMargin(
+          tx,
+          await tx.findOrder(event.orderId),
+          event.market,
+          new Date(event.timestamp),
+        );
+
         await tx.updateOrderStatus({
           orderId: event.orderId,
           status: "EXPIRED",
@@ -174,8 +143,12 @@ export class PersistenceService {
 
       case "trade.executed":
         await tx.createFills(fillsFromTrade(event));
-        
-        // Handle maker order
+
+        // Read both orders once: the release path clears lockedMargin, and the position
+        // mapping needs the leverage the order was submitted with.
+        const makerOrder = await tx.findOrder(event.makerOrderId);
+        const takerOrder = await tx.findOrder(event.takerOrderId);
+
         const makerStatus = orderStatusFromRemaining(event.makerOrderRemainingQtyLots);
         await tx.updateOrderStatus({
           orderId: event.makerOrderId,
@@ -183,27 +156,11 @@ export class PersistenceService {
           remainingQuantity: decimalString(event.makerOrderRemainingQtyLots),
           updatedAt: new Date(event.timestamp),
         });
-        
-        // Unlock margin for filled portion of maker order
+
         if (makerStatus === "FILLED") {
-          const makerOrder = await tx.findOrder(event.makerOrderId);
-          if (makerOrder && !makerOrder.reduceOnly) {
-            const market = await tx.findMarket(event.market);
-            if (market) {
-              const leverage = 10;
-              const price = Number(makerOrder.price || 0);
-              const totalQuantity = Number(makerOrder.quantity);
-              const notional = price * totalQuantity;
-              const marginLocked = notional / leverage;
-              const feeEstimate = notional * Number(market.takerFeeRate);
-              const totalToUnlock = marginLocked + feeEstimate;
-              
-              await tx.unlockBalanceForOrder(makerOrder.userId, "USDC", totalToUnlock);
-            }
-          }
+          await releaseOrderMargin(tx, makerOrder, event.market, new Date(event.timestamp));
         }
-        
-        // Handle taker order
+
         const takerStatus = orderStatusFromRemaining(event.takerOrderRemainingQtyLots);
         await tx.updateOrderStatus({
           orderId: event.takerOrderId,
@@ -211,27 +168,12 @@ export class PersistenceService {
           remainingQuantity: decimalString(event.takerOrderRemainingQtyLots),
           updatedAt: new Date(event.timestamp),
         });
-        
-        // Unlock margin for filled portion of taker order
+
         if (takerStatus === "FILLED") {
-          const takerOrder = await tx.findOrder(event.takerOrderId);
-          if (takerOrder && !takerOrder.reduceOnly) {
-            const market = await tx.findMarket(event.market);
-            if (market) {
-              const leverage = 10;
-              const price = Number(takerOrder.price || 0);
-              const totalQuantity = Number(takerOrder.quantity);
-              const notional = price * totalQuantity;
-              const marginLocked = notional / leverage;
-              const feeEstimate = notional * Number(market.takerFeeRate);
-              const totalToUnlock = marginLocked + feeEstimate;
-              
-              await tx.unlockBalanceForOrder(takerOrder.userId, "USDC", totalToUnlock);
-            }
-          }
+          await releaseOrderMargin(tx, takerOrder, event.market, new Date(event.timestamp));
         }
-        
-        await applyTradeToPositions(tx, event);
+
+        await applyTradeToPositions(tx, event, makerOrder, takerOrder);
         return [
           "fills.create_many",
           "orders.update_maker_after_trade",
@@ -245,9 +187,46 @@ export class PersistenceService {
   }
 }
 
+/**
+ * Release the collateral an order actually reserved at submit time.
+ *
+ * The amount is read from the order row rather than recomputed: reconstructing it needs the
+ * order's leverage (which used to be hardcoded to 10) and its price (which is null for every
+ * market order), so the old reconstruction over-released, under-released, or released nothing
+ * depending on the order. `lockedMargin > 0` doubles as the once-only guard, since the column
+ * is zeroed in the same transaction.
+ */
+async function releaseOrderMargin(
+  tx: PersistenceTransaction,
+  order: OrderWrite | null,
+  marketId: string,
+  updatedAt: Date,
+): Promise<void> {
+  if (!order || order.reduceOnly) {
+    return;
+  }
+
+  const lockedMargin = Number(order.lockedMargin ?? 0);
+
+  if (!(lockedMargin > 0)) {
+    return;
+  }
+
+  const market = await tx.findMarket(marketId);
+
+  if (!market) {
+    return;
+  }
+
+  await tx.unlockBalanceForOrder(order.userId, market.quoteAsset, lockedMargin);
+  await tx.clearOrderLockedMargin(order.id, updatedAt);
+}
+
 async function applyTradeToPositions(
   tx: PersistenceTransaction,
   event: TradeExecuted,
+  makerOrder: OrderWrite | null,
+  takerOrder: OrderWrite | null,
 ): Promise<void> {
   const market = await tx.findMarket(event.market);
 
@@ -255,8 +234,8 @@ async function applyTradeToPositions(
     throw new Error(`market not found: ${event.market}`);
   }
 
-  await applyRoleFillToPosition(tx, event, "MAKER", marketToRiskConfig(market));
-  await applyRoleFillToPosition(tx, event, "TAKER", marketToRiskConfig(market));
+  await applyRoleFillToPosition(tx, event, "MAKER", marketToRiskConfig(market), makerOrder);
+  await applyRoleFillToPosition(tx, event, "TAKER", marketToRiskConfig(market), takerOrder);
 }
 
 async function applyRoleFillToPosition(
@@ -264,12 +243,13 @@ async function applyRoleFillToPosition(
   event: TradeExecuted,
   role: "MAKER" | "TAKER",
   market: MarketRiskConfig,
+  order: OrderWrite | null,
 ): Promise<void> {
   const userId = role === "MAKER" ? event.makerUserId : event.takerUserId;
   const side = role === "MAKER" ? event.makerSide : event.takerSide;
   const existing = positionFromWrite(
     await tx.findPosition(userId, event.market),
-  ) ?? emptyPosition(userId, event.market, 10);
+  ) ?? emptyPosition(userId, event.market, order?.leverage ?? DEFAULT_LEVERAGE);
   const fill: FillInput = {
     userId,
     marketId: event.market,

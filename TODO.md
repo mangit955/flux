@@ -74,30 +74,36 @@ verified locally are marked as such inline rather than stated as fact.
   Use `SELECT ... FOR UPDATE` or Prisma `{ increment }`, and add a DB
   `CHECK (locked <= total)` constraint as a backstop.
 
-- [ ] **6. Stop hardcoding `leverage = 10` in the unlock path**
-  `persistence-service.ts:92, 123, 156, 193, 221` — **five** duplicated copies (not four), one
-  with a comment admitting it should be stored on the order. The lock side uses
-  `input.leverage ?? 10` (`prisma-api-runtime.ts:310, 320`; `exchange-runtime.ts:144`).
-  At 20x the user gets back 2x what was locked; at 5x margin is stranded permanently.
-  Store `lockedMargin` on the order row at submit time and release exactly that value.
-  This deletes all five reconstructions.
+- [x] **6. Stop hardcoding `leverage = 10` in the unlock path**
+  Fixed together with #7 and #8, since all three lived in the same five blocks. `orders` now
+  carries `lockedMargin` and `leverage` (`prisma/schema.prisma:183-184`, migration
+  `20260805000000_order_locked_margin`), written at submit time from the value the lock side
+  already computed (`prisma-api-runtime.ts:331` → `:400-402`). All five reconstructions are
+  replaced by one `releaseOrderMargin()` helper (`persistence-service.ts:199-223`) that
+  releases the *recorded* amount and zeroes the column in the same transaction, which also
+  makes double-release impossible.
 
-  Two further hardcoded-leverage sites to fix with it: `emptyPosition(userId, market, 10)` at
-  `persistence-service.ts:272` and `workers.ts:271`, against a function whose own default is
-  `leverage = 1` (`packages/risk/src/position-engine.ts:13`).
+  The two `emptyPosition(userId, market, 10)` sites went with it: both now read the order's
+  stored leverage (`persistence-service.ts:252`, `workers.ts:274`). `RuntimeOrder` gained a
+  `leverage` field so the in-memory path carries it too.
 
-- [ ] **7. Fix market orders leaking 100% of locked margin**
-  Same five blocks — `Number(order.price || 0)` at `persistence-service.ts:93, 124, 157, 194,
-  222`. `Order.price` is `Decimal?` (`prisma/schema.prisma:180`) and market orders have
-  `price = null`, so `totalToUnlock` is always 0. `MARKET_LIQUIDITY_EXHAUSTED` is a routine
-  engine outcome, so this fires constantly.
-  Resolved by the same fix as #6: release the recorded amount, never a recomputed one.
+- [x] **7. Fix market orders leaking 100% of locked margin**
+  Same fix — the release no longer touches `order.price`, so a null price is irrelevant.
 
-- [ ] **8. Use `market.quoteAsset` instead of hardcoded `"USDC"`**
-  Same five blocks — `persistence-service.ts:100, 134, 163, 201, 229`.
-  Separately, the `order.cancelled` block alone (`:131-132`) makes a second, redundant
-  `tx.findMarket(event.market)` call assigned to `marketData`; the local `market` already
-  holds the same row, and `marketData` is only ever read as a null guard. Remove it.
+  Correction to this item's premise: `MARKET_LIQUIDITY_EXHAUSTED` is emitted by `orderExpired`
+  (`packages/matching-engine/src/orderbook.ts:97-101`), so the routine leak ran through the
+  `order.expired` block, not `order.rejected` — `order.rejected` only comes from
+  `validateNewOrder` (`orderbook.ts:77-79`). Both paths are fixed.
+
+- [x] **8. Use `market.quoteAsset` instead of hardcoded `"USDC"`**
+  `MarketWrite` had no `quoteAsset` field at all; it was added (`records.ts:73`) and is mapped
+  from the row in `PrismaPersistenceStore.findMarket`. The redundant `marketData` lookup in the
+  cancel block went with the rest of that block.
+
+  Covered by six tests in `persistence-service.test.ts`, each verified to fail against the old
+  reconstruction before being kept. `InMemoryPersistenceStore` now tracks balances for real
+  (it previously stubbed the unlock with a `console.log`), so the `locked <= total` invariant is
+  actually asserted. `PrismaApiRuntime`'s lock-write half remains untested — see #37.
 
 - [ ] **9. Get money off floats**
   `prisma-api-runtime.ts:681` (`decimal()` → `Number`), writes via `String(number)`.
@@ -365,7 +371,7 @@ verified locally are marked as such inline rather than stated as fact.
 ## Suggested execution order
 
 **Week 1 — credibility floor**
-~~#1, #1b, #2~~ (done) → #6, #7, #8 (one change fixes all three across the same five blocks)
+~~#1, #1b, #2~~ → ~~#6, #7, #8~~ (done — one change fixed all three across the same five blocks)
 → #5 → #3, #4. Outcome: green CI, and money that actually moves correctly.
 
 **Week 2 — close the domain gaps**

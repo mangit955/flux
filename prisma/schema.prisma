@@ -180,6 +180,8 @@ model Order {
   price             Decimal?    @db.Decimal(36, 18)
   quantity          Decimal     @db.Decimal(36, 18)
   remainingQuantity Decimal     @db.Decimal(36, 18)
+  lockedMargin      Decimal     @default(0) @db.Decimal(36, 18)
+  leverage          Int         @default(10)
   reduceOnly        Boolean     @default(false)
   postOnly          Boolean     @default(false)
   status            OrderStatus @default(PENDING)
